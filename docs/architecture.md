@@ -42,7 +42,13 @@
 - `autocommit` はデフォルト ON 相当で、`begin()` 呼び出し時のみセッションを張る（未対応環境では no-op）。
 - SQLAlchemy 方言を提供し、モジュール属性（apilevel/threadsafety/paramstyle=pyformat、スキーム `mongodb+dbapi://`）を設定する。Core の text() ベースで確認済み、Table/Column 互換と ORM CRUD は今後拡張、async dialect はロードマップ上で検討。
 - 拡張機能: サブクエリ（FROM サブクエリなど）/UNION/HAVING/非等価・多段 JOIN/ILIKE・正規表現リテラル/名前付きパラメータ/ウィンドウ関数の翻訳パスを追加し、Decimal/UUID/tz datetime など型変換のポリシーを明確化する。
-- 優先実装順: 1) SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）、2) ORM 最小 CRUD、3) async dialect（Core CRUD 基準）、4) ウィンドウ関数（Mongo 5+ 前提）。
+- 優先実装順: 1) SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）、2) ORM 最小 CRUD、3) async dialect（Core CRUD/DDL/Index を sync ラップで提供。将来は motor 等のネイティブ async を検討）、4) ウィンドウ関数（Mongo 5+ 前提）。
+
+## async 方言の設計方針（概要）
+- API: SQLAlchemy 2.0 の async Engine/Connection (`create_async_engine`) から CRUD/DDL/Index を実行できるようにする。翻訳経路は sync と共通。
+- 実装方式: 当面は sync 実装をスレッドプールでラップし、非同期アプリから await 可能にする。高負荷時のスレッド数/接続数は利用者側で制御する前提。ネイティブ async（motor など）は将来検討。
+- トランザクション: ポリシーは sync と同じ。MongoDB 4.x 以降でのみ begin/commit/rollback を有効化し、3.6 では no-op。README に期待値を明示する。
+- 非対応: ORM/relationship、複雑なメタデータ API、statement cache、ウィンドウ関数（Mongo 5 未満は [mdb][E2]）。
 
 ## 設定と環境
 - 環境変数（例）: `MONGODB_URI`（接続先 URI）、`MONGODB_DB`（デフォルト DB 名）。`.env.sample` は作成せず、必要なら `.env` を手元で用意する。

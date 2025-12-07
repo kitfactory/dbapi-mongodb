@@ -181,6 +181,7 @@
 - SQLAlchemy からの CRUD/SELECT/WHERE/ORDER/LIMIT/OFFSET/JOIN/DDL 呼び出しを受け付ける。
 - トランザクションは MongoDB 4.0+ でのみ有効化し、3.6 では no-op で成功扱いとする。
 - ウィンドウ関数を含むクエリは MongoDB 5.0 未満では `[mdb][E2] Unsupported SQL construct: WINDOW_FUNCTION` を返す。
+- async 方言: Core CRUD/DDL/Index を async API（`create_async_engine`）経由で実行できるようにし、当面は sync 実装をスレッドプールでラップする（将来ネイティブ async も検討）。トランザクションポリシーは sync と同じ（4.x のみ有効、3.6 は no-op）、ORM/relationship や statement cache は対象外。README に保証レベルと制限事項を明記する。
 
 ## 11. 拡張機能（F11/F12）
 - P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index を実通信で通す）  
@@ -192,5 +193,5 @@
   - 名前付きパラメータ: `%(name)s` を dict で受け、不足/余剰は [mdb][E4]。  
   - 型拡張: Decimal/UUID は文字列化、tz 付き datetime はそのまま返却、Binary は base64 文字列化。未対応型は文字列化。  
 - P2: ORM 最小 CRUD（単一テーブル相当の add/get/select/update/delete。PK を `_id` にマッピングし、リレーション/JOIN は当面対象外）  
-- P3: async dialect（Core CRUD/DDL/Index を async でラップ。トランザクション方針は同期と同じ）  
+- P3: async dialect（Core CRUD/DDL/Index を async でラップ。トランザクション方針は同期と同じ。実装はスレッドプールラップをベースとし、ネイティブ async は将来検討）  
 - P4: Mongo 5+ 拡張（低優先度。`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` で対応。Mongo 5.0 未満は [mdb][E2]。その他のウィンドウ関数は非対応）
