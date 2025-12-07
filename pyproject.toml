@@ -1,5 +1,5 @@
 [project]
-name = "mongo-dbapi"
+name = "dbapi-mongodb"
 version = "0.1.0"
 description = "DBAPI-style adapter that translates SQL (JOIN/DDL/aggregations) into MongoDB operations"
 readme = "README.md"
