@@ -398,6 +398,15 @@ def test_sqlalchemy_union_distinct_is_rejected():
     metadata.drop_all(engine)
 
 
+def test_transaction_on_unsupported_server_is_noop():
+    # 3.6 相当サーバー想定で、begin/commit が no-op で例外にならないことを確認
+    conn = connect("mongodb://127.0.0.1:27018", MONGODB_DB)
+    conn.begin()
+    conn.commit()
+    conn.rollback()
+    conn.close()
+
+
 def test_sqlalchemy_orm_minimal_crud():
     engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
     Base = declarative_base()
@@ -456,6 +465,23 @@ def test_parse_error_returns_e5():
     with pytest.raises(MongoDbApiError) as exc:
         cur.execute("SELCT * FROM users")
     assert "[mdb][E5]" in str(exc.value)
+    conn.close()
+
+
+def test_correlated_subquery_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError):
+        cur.execute("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users x WHERE x.id = u.id)")
+    conn.close()
+
+
+def test_having_non_aggregate_column_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, name, score) VALUES (1, 'A', 10)")
+    with pytest.raises(Exception):
+        cur.execute("SELECT name, SUM(score) FROM users GROUP BY name HAVING id > 0")
     conn.close()
 
 
