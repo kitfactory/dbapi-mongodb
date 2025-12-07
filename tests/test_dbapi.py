@@ -253,6 +253,25 @@ def test_missing_named_param_raises():
     conn.close()
 
 
+def test_union_without_all_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (10, "X"))
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELECT id FROM users UNION SELECT id FROM users")
+    assert "[mdb][E2]" in str(exc.value)
+    conn.close()
+
+
+def test_non_equi_join_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELECT * FROM users u JOIN orders o ON u.id > o.user_id")
+    assert "[mdb][E2]" in str(exc.value)
+    conn.close()
+
+
 def test_sqlalchemy_core_table_crud():
     engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
     metadata = MetaData()
@@ -298,6 +317,15 @@ def test_sqlalchemy_core_table_crud_with_index():
         rows = conn.execute(select(users.c.id, users.c.name).where(users.c.id == 10)).all()
         assert rows == [(10, "Idx")]
     metadata.drop_all(engine)
+
+
+def test_sqlalchemy_named_param_mismatch_raises():
+    engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM users WHERE id = 999"))
+        with pytest.raises(Exception) as exc:
+            conn.execute(text("SELECT id FROM users WHERE id = :id"), {"other": 1})
+    assert "id" in str(exc.value)
 
 
 def test_sqlalchemy_core_join_and_union_all():

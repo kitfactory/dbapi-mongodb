@@ -1,6 +1,9 @@
 import asyncio
 import os
 
+import pytest
+
+from mongo_dbapi import MongoDbApiError
 from mongo_dbapi.async_dbapi import connect_async
 
 
@@ -19,5 +22,14 @@ def test_async_crud_roundtrip():
         await cur.execute("DELETE FROM users WHERE id = %s", (999,))
         await conn.commit()
         await conn.close()
+
+    asyncio.run(_run())
+
+
+def test_async_invalid_uri_raises():
+    async def _run():
+        with pytest.raises(MongoDbApiError) as exc:
+            await connect_async("", MONGODB_DB)
+        assert "[mdb][E1]" in str(exc.value)
 
     asyncio.run(_run())
