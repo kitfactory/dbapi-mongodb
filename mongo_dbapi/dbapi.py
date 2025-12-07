@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Iterable, List, Mapping, Sequence
+import base64
+import decimal
+import uuid
+import datetime
+
+from bson import ObjectId
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, OperationFailure
+
+from .errors import raise_error
+from .translation import QueryParts, parse_sql
+
+logger = logging.getLogger("mongo_dbapi")
+
+
+def _convert_value(value: Any) -> Any:
+    """Convert Mongo value to Python-friendly value / Mongo の値を Python 向けに変換"""
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict) and "$binary" in value:
+        return value  # leave as-is for now
+    return value
+
+
+@dataclass
+class CursorState:
+    rows: List[tuple] | None = None
+    rowcount: int = -1
+    lastrowid: Any | None = None
+    description: List[tuple] | None = None
+
+
+class Cursor:
+    """DBAPI-like cursor / DBAPI 風カーソル"""
+
+    def __init__(self, connection: "Connection"):
+        self.connection = connection
+        self._state = CursorState()
+        self._closed = False
+
+    def execute(self, sql: str, params: Sequence | Mapping | None = None) -> "Cursor":
+        if self._closed:
+            raise_error("[mdb][E5]", "Failed to parse SQL")
+        parts = parse_sql(sql, params)
+        self._state = self.connection._execute_parts(parts)  # noqa: SLF001
+        return self
+
+    def fetchone(self) -> tuple | None:
+        if not self._state.rows:
+            return None
+        return self._state.rows.pop(0)
+
+    def fetchall(self) -> List[tuple]:
+        rows = self._state.rows or []
+        self._state.rows = []
+        return rows
+
+    @property
+    def rowcount(self) -> int:
+        return self._state.rowcount
+
+    @property
+    def lastrowid(self) -> Any:
+        return self._state.lastrowid
+
+    @property
+    def description(self) -> List[tuple] | None:
+        return self._state.description
+
+    def close(self) -> None:
+        self._closed = True
+
+
+class Connection:
+    """DBAPI-like connection / DBAPI 風接続"""
+
+    def __init__(self, uri: str, db_name: str):
+        if not uri:
+            raise_error("[mdb][E1]")
+        self._uri = uri
+        self._db_name = db_name
+        try:
+            self._client = MongoClient(uri)
+            self._db = self._client[db_name]
+        except ConnectionFailure as exc:
+            raise_error("[mdb][E7]", cause=exc)
+        except OperationFailure as exc:
+            raise_error("[mdb][E8]", cause=exc)
+        self._session = None
+        self._transactions_supported = self._detect_transactions()
+        self._window_supported = self._detect_window()
+
+    def _detect_transactions(self) -> bool:
+        try:
+            info = self._client.server_info()
+            version_str = info.get("version", "0.0")
+            major = int(version_str.split(".")[0])
+            return major >= 4
+        except Exception:
+            return False
+
+    def _detect_window(self) -> bool:
+        try:
+            info = self._client.server_info()
+            version_str = info.get("version", "0.0")
+            major = int(version_str.split(".")[0])
+            minor = int(version_str.split(".")[1])
+            return major > 5 or (major == 5 and minor >= 0)
+        except Exception:
+            return False
+
+    def cursor(self) -> Cursor:
+        return Cursor(self)
+
+    def begin(self) -> None:
+        if not self._transactions_supported:
+            logger.debug("Transaction not supported; no-op / トランザクション非対応のため no-op")
+            return
+        logger.debug("Starting transaction session / トランザクションセッション開始")
+        self._session = self._client.start_session()
+        self._session.start_transaction()
+
+    def commit(self) -> None:
+        if self._session:
+            logger.debug("Commit transaction / トランザクションコミット")
+            self._session.commit_transaction()
+            self._session.end_session()
+            self._session = None
+
+    def rollback(self) -> None:
+        if self._session:
+            logger.debug("Abort transaction / トランザクションアボート")
+            self._session.abort_transaction()
+            self._session.end_session()
+            self._session = None
+
+    def close(self) -> None:
+        self._client.close()
+
+    def list_tables(self) -> list[str]:
+        return self._db.list_collection_names()
+
+    def _execute_parts(self, parts: QueryParts) -> CursorState:
+        if parts.operation == "find":
+            return self._execute_find(parts)
+        if parts.operation == "insert":
+            return self._execute_insert(parts)
+        if parts.operation == "update":
+            return self._execute_update(parts)
+        if parts.operation == "delete":
+            return self._execute_delete(parts)
+        if parts.operation == "aggregate":
+            return self._execute_aggregate(parts)
+        if parts.operation == "create":
+            return self._execute_create(parts)
+        if parts.operation == "drop":
+            return self._execute_drop(parts)
+        if parts.operation == "create_index":
+            return self._execute_create_index(parts)
+        if parts.operation == "drop_index":
+            return self._execute_drop_index(parts)
+        if parts.operation == "union_all":
+            return self._execute_union_all(parts)
+        if parts.operation == "window":
+            if not self._window_supported:
+                raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+            raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+        raise_error("[mdb][E2]")
+
+    def _execute_find(self, parts: QueryParts) -> CursorState:
+        proj = None
+        columns: list[str] | None = None
+        if parts.projection:
+            proj = {field: 1 for field in parts.projection}
+            columns = parts.projection
+        logger.debug(
+            "Executing find / find 実行: collection=%s filter=%s projection=%s sort=%s limit=%s",
+            parts.collection,
+            parts.filter,
+            proj,
+            parts.sort,
+            parts.limit,
+        )
+        cursor = self._db[parts.collection].find(parts.filter or {}, projection=proj, session=self._session)
+        if parts.sort:
+            cursor = cursor.sort(parts.sort)
+        if parts.skip:
+            cursor = cursor.skip(parts.skip)
+        if parts.limit:
+            cursor = cursor.limit(parts.limit)
+        docs = list(cursor)
+        if columns is None and docs:
+            columns = sorted(docs[0].keys())
+        rows = []
+        for doc in docs:
+            row = tuple(_convert_value(doc.get(col)) for col in columns or [])
+            rows.append(row)
+        description = None
+        if columns:
+            description = [(col, None, None, None, None, None, None) for col in columns]
+        return CursorState(rows=rows, rowcount=len(rows), description=description)
+
+    def _execute_insert(self, parts: QueryParts) -> CursorState:
+        logger.debug("Executing insert_one / insert_one 実行: collection=%s values=%s", parts.collection, parts.values)
+        doc = {k: _convert_value(v) for k, v in (parts.values or {}).items()}
+        result = self._db[parts.collection].insert_one(doc, session=self._session)
+        return CursorState(rows=[], rowcount=1, lastrowid=_convert_value(result.inserted_id))
+
+    def _execute_update(self, parts: QueryParts) -> CursorState:
+        logger.debug(
+            "Executing update_many / update_many 実行: collection=%s filter=%s update=%s",
+            parts.collection,
+            parts.filter,
+            parts.update,
+        )
+        result = self._db[parts.collection].update_many(parts.filter or {}, parts.update or {}, session=self._session)
+        return CursorState(rows=[], rowcount=result.modified_count)
+
+    def _execute_delete(self, parts: QueryParts) -> CursorState:
+        logger.debug(
+            "Executing delete_many / delete_many 実行: collection=%s filter=%s",
+            parts.collection,
+            parts.filter,
+        )
+        result = self._db[parts.collection].delete_many(parts.filter or {}, session=self._session)
+        return CursorState(rows=[], rowcount=result.deleted_count)
+
+    def _execute_create_index(self, parts: QueryParts) -> CursorState:
+        logger.debug(
+            "Executing create_index / インデックス作成: collection=%s name=%s keys=%s unique=%s",
+            parts.collection,
+            parts.index_name,
+            parts.index_keys,
+            parts.unique,
+        )
+        try:
+            self._db[parts.collection].create_index(parts.index_keys or [], name=parts.index_name, unique=parts.unique)
+        except Exception:
+            pass
+        return CursorState(rows=[], rowcount=0)
+
+    def _execute_drop_index(self, parts: QueryParts) -> CursorState:
+        logger.debug("Executing drop_index / インデックス削除: collection=%s name=%s", parts.collection, parts.index_name)
+        try:
+            self._db[parts.collection].drop_index(parts.index_name)
+        except Exception:
+            pass
+        return CursorState(rows=[], rowcount=0)
+
+    def _execute_union_all(self, parts: QueryParts) -> CursorState:
+        rows: list[tuple] = []
+        description = None
+        for sub in parts.union_parts or []:
+            state = self._execute_parts(sub)
+            if description is None:
+                description = state.description
+            rows.extend(state.rows or [])
+        if parts.sort:
+            rows.sort(key=lambda r: tuple(r[0:len(parts.sort)]), reverse=False)
+        if parts.limit is not None:
+            rows = rows[: parts.limit]
+        return CursorState(rows=rows, rowcount=len(rows), description=description)
+
+    def _execute_aggregate(self, parts: QueryParts) -> CursorState:
+        logger.debug("Executing aggregate / aggregate 実行: collection=%s pipeline=%s", parts.collection, parts.pipeline)
+        cursor = self._db[parts.collection].aggregate(parts.pipeline or [], session=self._session)
+        docs = list(cursor)
+        projection_paths = parts.projection_paths
+        rows: list[tuple] = []
+
+        def _get_path(doc: dict, path: str) -> Any:
+            current = doc
+            for seg in path.split("."):
+                if isinstance(current, dict):
+                    current = current.get(seg)
+                else:
+                    current = None
+            return _convert_value(current)
+
+        if projection_paths:
+            columns = [out for _, out in projection_paths]
+            for doc in docs:
+                row = tuple(_get_path(doc, path) for path, _ in projection_paths)
+                rows.append(row)
+            description = [(col, None, None, None, None, None, None) for col in columns]
+        else:
+            if docs:
+                join_keys = sorted([k for k in docs[0].keys() if k.startswith("__join")])
+                columns_left = sorted([k for k in docs[0].keys() if not k.startswith("__join")])
+                columns_join: list[str] = []
+                for idx, jk in enumerate(join_keys):
+                    if isinstance(docs[0].get(jk), dict):
+                        columns_join.extend([f"{jk}.{k}" for k in sorted(docs[0][jk].keys())])
+                columns = columns_left + columns_join
+                for doc in docs:
+                    left_vals = tuple(_convert_value(doc.get(k)) for k in columns_left)
+                    join_vals_list = []
+                    for jk in join_keys:
+                        join_doc = doc.get(jk) or {}
+                        for col in sorted(join_doc.keys()) if isinstance(join_doc, dict) else []:
+                            join_vals_list.append(_convert_value(join_doc.get(col)))
+                    rows.append(left_vals + tuple(join_vals_list))
+                description = [(col, None, None, None, None, None, None) for col in columns] if columns else None
+            else:
+                description = None
+        return CursorState(rows=rows, rowcount=len(rows), description=description)
+
+    def _execute_create(self, parts: QueryParts) -> CursorState:
+        logger.debug("Executing create_collection / コレクション作成: %s", parts.collection)
+        try:
+            self._db.create_collection(parts.collection)
+        except Exception:
+            pass
+        return CursorState(rows=[], rowcount=0)
+
+    def _execute_drop(self, parts: QueryParts) -> CursorState:
+        logger.debug("Executing drop_collection / コレクション削除: %s", parts.collection)
+        self._db.drop_collection(parts.collection)
+        return CursorState(rows=[], rowcount=0)
+
+
+def connect(uri: str, db_name: str, **_: Any) -> Connection:
+    """DBAPI entry point / DBAPI エントリーポイント"""
+    return Connection(uri, db_name)

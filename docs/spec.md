@@ -1,0 +1,184 @@
+# mongo-dbapi 仕様
+
+## 前提: サポートする SQL 構文（拡張後）
+- 対応: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`（コレクション作成/削除）、`CREATE/DROP INDEX`、`WHERE` の比較 (`=`/`<>`/`>`/`<`/`<=`/`>=`)、`AND`、`OR`、`IN`、`BETWEEN`、`LIKE`（`%`/`_` を `$regex` に変換）、`ORDER BY`、`LIMIT`、`OFFSET`、INNER/LEFT JOIN の等価結合（複合キー、最大 2 段）、`GROUP BY` + 集約（COUNT/SUM/AVG/MIN/MAX）
+- 非対応: サブクエリ（将来対応予定）、非等価 JOIN、フル/右外部 JOIN、ウィンドウ関数、UNION、HAVING、正規表現リテラル、ILIKE。
+- プレースホルダー: `%s` の位置パラメータのみ対応。名前付きプレースホルダーは未対応。
+- `SELECT *` 時のフィールド順: コレクションのフィールド名をアルファベット順で返す。明示列指定時は SQL 記述順で返す。JOIN 時の `SELECT *` は左テーブル→右テーブルの順でアルファベット順。
+- パーサー: SQLGlot を使用し、将来のサブクエリ対応を可能にする。
+
+## 1. 接続 (F1)
+### 1.1. connect() に URI を渡した場合、MongoClient を初期化する (F1)
+- 前提: 有効な MongoDB URI と DB 名を渡す
+- 条件: `connect(uri, db_name)` を呼ぶ
+- 振る舞い: `pymongo.MongoClient` を生成し、指定 DB を保持する接続オブジェクトを返す
+
+### 1.2. URI が空文字の場合、エラーを送出する (F1, F5)
+- 前提: URI が空または None
+- 条件: `connect` を呼ぶ
+- 振る舞い: Error ID `[mdb][E1] Invalid connection URI` を送出する
+
+### 1.3. 接続失敗時はエラーを送出する (F1, F5)
+- 前提: URI に到達できない、またはホスト/ポートが無効
+- 条件: `connect` を呼ぶ
+- 振る舞い: Error ID `[mdb][E7] Connection failed` を送出する
+
+### 1.4. 認証失敗時はエラーを送出する (F1, F5)
+- 前提: 認証情報が誤っている
+- 条件: `connect` を呼ぶ
+- 振る舞い: Error ID `[mdb][E8] Authentication failed` を送出する
+
+## 2. SELECT 変換 (F2)
+### 2.1. 単純な SELECT * が find に変換される (F2)
+- 前提: `SELECT * FROM users`
+- 条件: `cursor.execute(sql)` を呼ぶ
+- 振る舞い: `db["users"].find({})` を実行し、取得結果を行タプル配列で返す
+
+### 2.2. WHERE = 条件がフィルタに適用される (F2)
+- 前提: `SELECT * FROM users WHERE id = 1`
+- 条件: `cursor.execute(sql)` を呼ぶ
+- 振る舞い: `find({"id": 1})` を実行する
+
+### 2.3. LIMIT と ORDER BY が find オプションに適用される (F2)
+- 前提: `SELECT * FROM users WHERE active = true ORDER BY created_at DESC LIMIT 10`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `find({"active": true}).sort("created_at", -1).limit(10)` を実行する
+
+### 2.4. INNER/LEFT JOIN（等価結合）をサポートする (F2, F8)
+- 前提: `SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.user_id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 基底テーブルから `$lookup` で結合し、JOIN キーが一致する行を返す。LEFT JOIN の場合は右側が欠損しても返す。JOIN は 2 段まで、結合条件は等価のみ。
+
+### 2.5. LIKE/BETWEEN/OR をサポートする (F2, F8)
+- 前提: `LIKE '%foo%'`, `BETWEEN 1 AND 10`, `OR` 条件を含む SELECT
+- 条件: `cursor.execute(sql)`
+- 振る舞い: LIKE は `%`/`_` を正規表現に変換し `$regex` で実行、BETWEEN は比較に展開、OR は `$or` で評価する
+
+### 2.6. 明示列の順序と SELECT * の順序を固定する (F2)
+- 前提: `SELECT col2, col1 FROM users` または `SELECT * FROM users`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 明示列は SQL 記述順で返し、`SELECT *` はフィールド名をアルファベット順に並べて返す
+
+### 2.7. GROUP BY と集計関数をサポートする (F2, F8)
+- 前提: `SELECT status, COUNT(*) FROM orders GROUP BY status`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `$group` に変換し、集計結果を返す（COUNT/SUM/AVG/MIN/MAX をサポート）。HAVING は未対応。
+
+## 3. DML 変換 (F3)
+### 3.1. INSERT が insert_one に変換される (F3)
+- 前提: `INSERT INTO users (id, name) VALUES (1, 'Alice')`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `db["users"].insert_one({"id": 1, "name": "Alice"})` を実行し、挿入件数を 1 として返す
+
+### 3.2. UPDATE が update_many に変換される (F3)
+- 前提: `UPDATE users SET name = 'Bob' WHERE id = 1`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `update_many({"id": 1}, {"$set": {"name": "Bob"}})` を実行し、影響件数を返す
+
+### 3.3. DELETE が delete_many に変換される (F3)
+- 前提: `DELETE FROM users WHERE id = 1`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `delete_many({"id": 1})` を実行し、削除件数を返す
+
+### 3.4. WHERE なしの UPDATE/DELETE はガードする (F3, F5)
+- 前提: `UPDATE users SET name = 'Bob'` または `DELETE FROM users`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: Error ID `[mdb][E3] Unsafe operation without WHERE` を送出する
+
+## 4. パラメータバインド (F4)
+### 4.1. プレースホルダーに位置引数を適用する (F4)
+- 前提: `SELECT * FROM users WHERE id = %s` とパラメータ `(1,)`
+- 条件: `cursor.execute(sql, params)`
+- 振る舞い: フィルタ `{"id": 1}` を生成し `find` を実行する
+
+### 4.2. プレースホルダー数とパラメータ数が不一致の場合、エラーを送出する (F4, F5)
+- 前提: `SELECT * FROM users WHERE id = %s` とパラメータが空
+- 条件: `cursor.execute(sql, params)`
+- 振る舞い: Error ID `[mdb][E4] Parameter count mismatch` を送出する
+
+### 4.3. 名前付きプレースホルダーは未対応として扱う (F4, F5)
+- 前提: `SELECT * FROM users WHERE id = %(id)s`
+- 条件: `cursor.execute(sql, params)`
+- 振る舞い: Error ID `[mdb][E2] Unsupported SQL construct: NAMED_PARAMETER` を送出する
+
+## 5. 例外/エラーメッセージ (F5)
+- Error ID とメッセージは下表のとおり。実装は文字列を完全一致で返す。
+
+| Error ID | 条件 | メッセージ |
+| --- | --- | --- |
+| [mdb][E1] | URI が空/None | `Invalid connection URI` |
+| [mdb][E2] | JOIN など未対応構文 | `Unsupported SQL construct: <keyword>` |
+| [mdb][E3] | WHERE なしの UPDATE/DELETE | `Unsafe operation without WHERE` |
+| [mdb][E4] | プレースホルダー数とパラメータ数が不一致 | `Parameter count mismatch` |
+| [mdb][E5] | SQL 解析に失敗 | `Failed to parse SQL` |
+| [mdb][E6] | トランザクションが未対応のサーバー | `Transactions not supported on this server` |
+| [mdb][E7] | 接続に失敗 | `Connection failed` |
+| [mdb][E8] | 認証に失敗 | `Authentication failed` |
+
+## 6. トランザクション/セッション (F6)
+### 6.1. begin/commit/rollback が Mongo セッションをラップする (F6)
+- 前提: 接続がレプリカセット/トランザクション対応クラスタに接続済み
+- 条件: `connection.begin()`, `connection.commit()`, `connection.rollback()` を呼ぶ
+- 振る舞い: MongoDB セッションを開始/コミット/アボートし、失敗時は [mdb][E5] で包んで送出する
+
+### 6.2. サーバーがトランザクション非対応の場合、開始前にエラーを返す (F6, F5)
+- 前提: 接続先がスタンドアロン構成またはトランザクション未対応バージョン（例: MongoDB 3.6）
+- 条件: `connection.begin()` を呼ぶ
+- 振る舞い: エラーは送出せず、内部的にはセッションを張らずに no-op とし、後続の `commit`/`rollback` も成功扱いで返す
+
+## 7. メタデータ取得 (F7)
+### 7.1. コレクション一覧を返す (F7)
+- 前提: 有効な接続
+- 条件: `connection.list_tables()` を呼ぶ
+- 振る舞い: DB のコレクション名一覧をリストで返す
+
+## 8. DDL 変換 (F8 相当)
+### 8.1. CREATE TABLE がコレクション作成に変換される
+- 前提: `CREATE TABLE users (...)`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `db.create_collection("users")` を呼び、存在していてもエラーにしない
+
+### 8.2. DROP TABLE がコレクション削除に変換される
+- 前提: `DROP TABLE users`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `db.drop_collection("users")` を呼ぶ（存在しなくてもエラーにしない）
+
+### 8.3. CREATE INDEX がインデックス作成に変換される
+- 前提: `CREATE INDEX idx_users_name ON users(name)`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `db["users"].create_index("name", name="idx_users_name")` を実行する（ASC/DESC 指定、複合インデックス、UNIQUE オプションを受け付ける。既存の場合はエラーにせずスキップ）
+
+### 8.4. DROP INDEX がインデックス削除に変換される
+- 前提: `DROP INDEX idx_users_name ON users`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `db["users"].drop_index("idx_users_name")` を実行する（存在しなくてもエラーにしない）
+
+## 8. DBAPI 互換の補足
+- `rowcount`: 書き込み系は影響件数、SELECT は取得件数を保持する。
+- `lastrowid`: INSERT の `inserted_id` を返す（ObjectId は文字列化して返却）。
+- `description`: SELECT 時に列名を列挙し、型は簡易に Python 型名または `str` を返す。
+- `autocommit`: MongoDB は非トランザクションが基本のため、デフォルト autocommit 相当とし、`begin()` 時のみセッションを張る。
+- カーソル再利用: 同一カーソルで複数回 `execute` を呼ぶと最新の結果に上書きする。
+
+## 9. 型変換方針
+- `ObjectId` は文字列化して返す。
+- `datetime` は `datetime` のまま返す。
+- 数値/ブール/文字列は MongoDB の値をそのまま対応付けて返す。
+- サポート外の型は文字列化し、元型のまま返すかどうかは将来拡張とする。
+
+## 10. SQLAlchemy 方言（F10）
+- DBAPI モジュール属性（`apilevel`、`threadsafety`、`paramstyle=pyformat`）を提供し、dialect から利用できるようにする。接続スキームは `mongodb+dbapi://`。
+- SQLAlchemy からの CRUD/SELECT/WHERE/ORDER/LIMIT/OFFSET/JOIN/DDL 呼び出しを受け付ける。
+- トランザクションは MongoDB 4.0+ でのみ有効化し、3.6 では no-op で成功扱いとする。
+- ウィンドウ関数を含むクエリは MongoDB 5.0 未満では `[mdb][E2] Unsupported SQL construct: WINDOW_FUNCTION` を返す。
+
+## 11. 今後の対応予定（F11/F12）
+- サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)`、`FROM (SELECT ...) AS t` をサポートする（スカラサブクエリは非対応）。サブクエリを先行実行し結果リストで置換する。
+- UNION/UNION ALL: `UNION ALL` をサポート（重複除去は非対応で [mdb][E2]）。ORDER/LIMIT は全体にのみ適用。
+- HAVING: GROUP BY 後の比較/AND/OR/IN/BETWEEN/LIKE を `$match` として適用する（非集計列を含む HAVING は [mdb][E2]）。
+- JOIN 拡張: 等価 JOIN の多段（最大 3 段）をサポート。非等価 JOIN、RIGHT/FULL OUTER は当面非対応（[mdb][E2]）。
+- ウィンドウ関数: `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` で対応（Mongo 5.0 未満は [mdb][E2]）。その他のウィンドウ関数は非対応。
+- 文字列マッチ: `ILIKE` を大小区別なし `$regex` に変換。`/pattern/` の正規表現リテラルも `$regex` で対応。
+- 名前付きパラメータ: `%(name)s` を受け付け、dict パラメータを必須にする。不足/余剰は [mdb][E4]。
+- 型拡張: Decimal/UUID は文字列化、tz 付き datetime はそのまま返却、Binary は base64 文字列化。未対応型は文字列化する。
+- 優先実装順: 1) SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）、2) ORM 最小 CRUD、3) async dialect（Core CRUD）、4) ウィンドウ関数（Mongo 5+）。
