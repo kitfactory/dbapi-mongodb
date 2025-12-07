@@ -47,6 +47,7 @@ class QueryParts:
     inline_token: str | None = None
     inline_rows: list[dict[str, Any]] | None = None
     inline_aggregates: list[tuple[str, str, str | None]] | None = None
+    uses_window: bool = False
 
 
 def preprocess_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None) -> tuple[str, list[Any], list[str]]:
@@ -473,9 +474,7 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
     if isinstance(expr, exp.Select):
         # window function detection
         if expr.find(exp.Window) or expr.find(exp.RowNumber) or expr.find(exp.Rank) or expr.find(exp.DenseRank):
-            table = expr.find(exp.Table)
-            collection = table.name if table and table.name else ""
-            return QueryParts(operation="window", collection=collection)
+            return _parse_window_select(expr, params_map, subqueries)
         if expr.args.get("joins"):
             parts = _parse_join_select(expr, params_map, subqueries)
         elif expr.args.get("group"):
@@ -628,6 +627,74 @@ def _parse_select_like(expr: exp.Select, params_map: dict[str, Any], subqueries:
     if expr.args.get("group"):
         return _parse_group_select(expr, params_map, subqueries)
     return _parse_select(expr, params_map, subqueries)
+
+
+def _parse_window_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
+    from_expr = expr.args.get("from_")
+    if not from_expr or not hasattr(from_expr, "this") or not from_expr.this.name:
+        raise_error("[mdb][E5]", "Failed to parse SQL")
+    if expr.args.get("joins"):
+        raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+    collection = from_expr.this.name
+    if expr.args.get("group"):
+        raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+    where_filter = None
+    if expr.args.get("where"):
+        where_filter = _condition_to_filter(expr.args["where"].this, params_map, subqueries)
+    window_expr = None
+    output_alias = None
+    base_columns: list[tuple[str, str]] = []
+    for item in expr.expressions:
+        target = item.this if isinstance(item, exp.Alias) else item
+        alias = item.alias_or_name
+        if isinstance(target, exp.Window) and isinstance(target.this, exp.RowNumber):
+            window_expr = target
+            output_alias = alias
+        elif isinstance(target, exp.Column):
+            base_columns.append((_field_name(target, params_map), alias))
+        else:
+            raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+    if not window_expr or not output_alias:
+        raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+    partition = window_expr.args.get("partition_by")
+    order = window_expr.args.get("order")
+    if partition and isinstance(partition, list) and len(partition) > 1:
+        raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
+    partition_expr = None
+    if partition:
+        target = partition[0] if isinstance(partition, list) else partition.expressions[0]
+        partition_expr = f"${_field_name(target, params_map)}"
+    sort_doc: dict[str, int] = {}
+    if order and order.expressions:
+        for e in order.expressions:
+            fld = _field_name(e.this, params_map)
+            direction = -1 if e.args.get("desc") else 1
+            sort_doc[fld] = direction
+    window_output = {output_alias: {"$documentNumber": {}}}
+    window_doc: dict[str, Any] = {"output": window_output}
+    if partition_expr:
+        window_doc["partitionBy"] = partition_expr
+    if sort_doc:
+        window_doc["sortBy"] = sort_doc
+    pipeline: list[dict[str, Any]] = []
+    if where_filter:
+        pipeline.append({"$match": where_filter})
+    pipeline.append({"$setWindowFields": window_doc})
+    project_doc: dict[str, Any] = {}
+    for path, alias in base_columns:
+        project_doc[alias] = f"${path}"
+    project_doc[output_alias] = f"${output_alias}"
+    if project_doc:
+        pipeline.append({"$project": project_doc})
+    projection_paths = [(alias, alias) for _, alias in base_columns]
+    projection_paths.append((output_alias, output_alias))
+    return QueryParts(
+        operation="aggregate",
+        collection=collection,
+        pipeline=pipeline,
+        projection_paths=projection_paths,
+        uses_window=True,
+    )
 
 
 def _parse_join_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:

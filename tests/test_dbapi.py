@@ -8,6 +8,7 @@ from bson import ObjectId
 import datetime
 from sqlalchemy import create_engine, text, Table, Column, Integer, String, MetaData, select, Index
 from sqlalchemy.orm import declarative_base, sessionmaker
+import pymongo
 import decimal
 import uuid
 
@@ -16,6 +17,21 @@ MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://127.0.0.1:27018")
 MONGODB_DB = os.environ.get("MONGODB_DB", "mongo_dbapi_test")
 DBAPI_URI = "mongodb+dbapi://" + MONGODB_URI.split("://", 1)[1].rstrip("/")
 COLLECTION = "users"
+
+
+def _window_supported(uri: str) -> bool:
+    client = pymongo.MongoClient(uri)
+    try:
+        info = client.admin.command("hello")
+    except Exception:
+        return False
+    max_wire = info.get("maxWireVersion", 0)
+    version = info.get("version", "0.0")
+    try:
+        major = int(str(version).split(".")[0])
+    except Exception:
+        major = 0
+    return max_wire >= 13 or major >= 5
 
 
 @pytest.fixture(autouse=True)
@@ -431,13 +447,17 @@ def test_binary_and_uuid():
     conn.close()
 
 
-@pytest.mark.skipif(os.environ.get("SKIP_WINDOW", "0") == "1", reason="Window functions not supported on this MongoDB")
 def test_window_row_number():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
     cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (1, "A"))
     cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (2, "A"))
     cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (3, "B"))
-    with pytest.raises(MongoDbApiError):
-        cur.execute("SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn FROM users")
+    if not _window_supported(MONGODB_URI):
+        with pytest.raises(MongoDbApiError):
+            cur.execute("SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn FROM users")
+    else:
+        cur.execute("SELECT id, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn FROM users ORDER BY id")
+        rows = cur.fetchall()
+        assert rows == [(1, "A", 1), (2, "A", 2), (3, "B", 1)]
     conn.close()

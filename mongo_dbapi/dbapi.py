@@ -167,6 +167,8 @@ class Connection:
     def _execute_parts(self, parts: QueryParts) -> CursorState:
         if parts.subqueries:
             parts = self._materialize_subqueries(parts)
+        if parts.uses_window and not self._window_supported:
+            raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
         if parts.operation == "from_subquery":
             return self._execute_from_subquery(parts)
         if parts.operation == "find":
@@ -189,15 +191,7 @@ class Connection:
             return self._execute_drop_index(parts)
         if parts.operation == "union_all":
             return self._execute_union_all(parts)
-        if parts.operation == "window":
-            if not self._window_supported:
-                raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
-            return self._execute_window(parts)
         raise_error("[mdb][E2]")
-
-    def _execute_window(self, parts: QueryParts) -> CursorState:
-        # Temporary stub: until translation builds $setWindowFields, return E2
-        raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
 
     def _materialize_subqueries(self, parts: QueryParts) -> QueryParts:
         """Execute subqueries and substitute placeholders / サブクエリを実行し置換"""
