@@ -280,6 +280,29 @@ def test_sqlalchemy_core_table_crud_with_index():
     metadata.drop_all(engine)
 
 
+def test_sqlalchemy_core_join_and_union_all():
+    engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
+    metadata = MetaData()
+    users = Table("core_users4", metadata, Column("id", Integer, primary_key=True), Column("name", String(50)))
+    orders = Table("core_orders4", metadata, Column("id", Integer, primary_key=True), Column("user_id", Integer), Column("total", Integer))
+    metadata.drop_all(engine)
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(users.insert(), [{"id": 1, "name": "U1"}, {"id": 2, "name": "U2"}])
+        conn.execute(orders.insert(), [{"id": 10, "user_id": 1, "total": 100}, {"id": 11, "user_id": 2, "total": 200}])
+        join_stmt = (
+            select(users.c.id, users.c.name, orders.c.total)
+            .select_from(users.join(orders, users.c.id == orders.c.user_id))
+            .order_by(users.c.id)
+        )
+        rows = conn.execute(join_stmt).all()
+        assert rows == [(1, "U1", 100), (2, "U2", 200)]
+        union_stmt = select(users.c.id).where(users.c.id == 1).union_all(select(users.c.id).where(users.c.id == 2))
+        union_rows = sorted(conn.execute(union_stmt).all())
+        assert union_rows == [(1,), (2,)]
+    metadata.drop_all(engine)
+
+
 def test_window_function_is_rejected():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()

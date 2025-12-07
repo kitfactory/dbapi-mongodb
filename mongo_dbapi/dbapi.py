@@ -56,6 +56,19 @@ class Cursor:
         self._state = self.connection._execute_parts(parts)  # noqa: SLF001
         return self
 
+    def executemany(self, sql: str, seq_of_params: Sequence[Sequence | Mapping]) -> "Cursor":
+        if self._closed:
+            raise_error("[mdb][E5]", "Failed to parse SQL")
+        total_rows = 0
+        lastrowid = None
+        for params in seq_of_params:
+            parts = parse_sql(sql, params)
+            state = self.connection._execute_parts(parts)  # noqa: SLF001
+            total_rows += state.rowcount
+            lastrowid = state.lastrowid
+        self._state = CursorState(rows=[], rowcount=total_rows, lastrowid=lastrowid, description=None)
+        return self
+
     def fetchone(self) -> tuple | None:
         if not self._state.rows:
             return None
