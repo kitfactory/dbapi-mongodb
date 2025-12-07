@@ -46,6 +46,7 @@ class QueryParts:
     subqueries: dict[str, dict[str, Any]] | None = None
     inline_token: str | None = None
     inline_rows: list[dict[str, Any]] | None = None
+    inline_aggregates: list[tuple[str, str, str | None]] | None = None
 
 
 def preprocess_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None) -> tuple[str, list[Any], list[str]]:
@@ -506,6 +507,7 @@ def _parse_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict
     from_expr = expr.args.get("from_")
     collection = None
     inline_token = None
+    aggregates: list[tuple[str, str, str | None]] = []
     if from_expr:
         if hasattr(from_expr, "this") and isinstance(from_expr.this, exp.Table) and from_expr.this.name:
             collection = from_expr.this.name
@@ -520,8 +522,30 @@ def _parse_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict
         else:
             raise_error("[mdb][E5]", "Failed to parse SQL")
     projection: List[str] | None = None
+    projection_paths: list[tuple[str, str]] | None = None
     if not expr.is_star:
-        projection = [c.alias_or_name for c in expr.expressions]
+        projection_paths = []
+        for item in expr.expressions:
+            target = item.this if isinstance(item, exp.Alias) else item
+            alias = item.alias_or_name
+            if isinstance(target, exp.Column):
+                projection_paths.append((_field_name(target, params_map), alias))
+            else:
+                projection_paths.append((alias, alias))
+        aggregates = []
+        for item in expr.expressions:
+            target = item.this if isinstance(item, exp.Alias) else item
+            alias = item.alias_or_name
+            if isinstance(target, exp.Count):
+                aggregates.append((alias, "count", None))
+            elif isinstance(target, exp.Sum):
+                aggregates.append((alias, "sum", _field_name(target.this, params_map)))
+            elif isinstance(target, exp.Avg):
+                aggregates.append((alias, "avg", _field_name(target.this, params_map)))
+            elif isinstance(target, exp.Min):
+                aggregates.append((alias, "min", _field_name(target.this, params_map)))
+            elif isinstance(target, exp.Max):
+                aggregates.append((alias, "max", _field_name(target.this, params_map)))
 
     mongo_filter = None
     if expr.args.get("where"):
@@ -548,11 +572,49 @@ def _parse_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict
         except Exception:
             skip_val = int(expr.args["offset"].expression.this)
 
+    if aggregates:
+        if inline_token:
+            return QueryParts(
+                operation="from_subquery",
+                collection=collection or "",
+                filter=mongo_filter or {},
+                projection=[alias for alias, _, _ in aggregates],
+                sort=sort_items,
+                limit=limit_val,
+                skip=skip_val,
+                inline_token=inline_token,
+                inline_aggregates=aggregates,
+                projection_paths=[(alias, alias) for alias, _, _ in aggregates],
+            )
+        pipeline: list[dict[str, Any]] = []
+        if mongo_filter:
+            pipeline.append({"$match": mongo_filter})
+        group_doc: dict[str, Any] = {"_id": None}
+        for alias, op, field in aggregates:
+            if op == "count":
+                group_doc[alias] = {"$sum": 1}
+            elif op == "sum":
+                group_doc[alias] = {"$sum": f"${field}"}
+            elif op == "avg":
+                group_doc[alias] = {"$avg": f"${field}"}
+            elif op == "min":
+                group_doc[alias] = {"$min": f"${field}"}
+            elif op == "max":
+                group_doc[alias] = {"$max": f"${field}"}
+        pipeline.append({"$group": group_doc})
+        return QueryParts(
+            operation="aggregate",
+            collection=collection or "",
+            pipeline=pipeline,
+            projection_paths=[(alias, alias) for alias, _, _ in aggregates],
+        )
+
     return QueryParts(
         operation="from_subquery" if inline_token else "find",
         collection=collection or "",
         filter=mongo_filter or {},
         projection=projection,
+        projection_paths=projection_paths,
         sort=sort_items,
         limit=limit_val,
         skip=skip_val,

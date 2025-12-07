@@ -6,6 +6,7 @@ from mongo_dbapi import MongoDbApiError, connect
 from bson import ObjectId
 import datetime
 from sqlalchemy import create_engine, text, Table, Column, Integer, String, MetaData, select, Index
+from sqlalchemy.orm import declarative_base, sessionmaker
 import decimal
 import uuid
 
@@ -24,11 +25,13 @@ def clean_db():
     db["orders"].delete_many({})
     db["addresses"].delete_many({})
     db["cities"].delete_many({})
+    db["orm_users"].delete_many({})
     yield
     db[COLLECTION].delete_many({})
     db["orders"].delete_many({})
     db["addresses"].delete_many({})
     db["cities"].delete_many({})
+    db["orm_users"].delete_many({})
     conn.close()
 
 
@@ -301,6 +304,34 @@ def test_sqlalchemy_core_join_and_union_all():
         union_rows = sorted(conn.execute(union_stmt).all())
         assert union_rows == [(1,), (2,)]
     metadata.drop_all(engine)
+
+
+def test_sqlalchemy_orm_minimal_crud():
+    engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
+    Base = declarative_base()
+
+    class User(Base):
+        __tablename__ = "orm_users"
+        id = Column(Integer, primary_key=True)
+        name = Column(String(50))
+
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    session.add(User(id=1, name="OrmUser"))
+    session.commit()
+    obj = session.query(User).filter_by(id=1).one()
+    assert obj.name == "OrmUser"
+    obj.name = "Updated"
+    session.commit()
+    obj = session.query(User).filter(User.id == 1).one()
+    assert obj.name == "Updated"
+    session.delete(obj)
+    session.commit()
+    assert session.query(User).filter_by(id=1).count() == 0
+    session.close()
+    Base.metadata.drop_all(engine)
 
 
 def test_window_function_is_rejected():

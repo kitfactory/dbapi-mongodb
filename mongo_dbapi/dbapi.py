@@ -292,6 +292,25 @@ class Connection:
     def _execute_from_subquery(self, parts: QueryParts) -> CursorState:
         rows = parts.inline_rows or []
         filtered = [r for r in rows if self._match_filter(r, parts.filter)]
+        if parts.inline_aggregates:
+            agg_result: dict[str, Any] = {}
+            for alias, op, field in parts.inline_aggregates:
+                if op == "count":
+                    agg_result[alias] = len(filtered)
+                elif op == "sum":
+                    agg_result[alias] = sum((r.get(field) or 0) for r in filtered)
+                elif op == "avg":
+                    vals = [r.get(field) for r in filtered if r.get(field) is not None]
+                    agg_result[alias] = (sum(vals) / len(vals)) if vals else None
+                elif op == "min":
+                    vals = [r.get(field) for r in filtered if r.get(field) is not None]
+                    agg_result[alias] = min(vals) if vals else None
+                elif op == "max":
+                    vals = [r.get(field) for r in filtered if r.get(field) is not None]
+                    agg_result[alias] = max(vals) if vals else None
+            result_rows = [tuple(agg_result.get(alias) for alias, _, _ in parts.inline_aggregates)]
+            description = [(alias, None, None, None, None, None, None) for alias, _, _ in parts.inline_aggregates]
+            return CursorState(rows=result_rows, rowcount=len(result_rows), description=description)
         if parts.sort:
             for field, direction in reversed(parts.sort):
                 filtered.sort(key=lambda r, f=field: r.get(f), reverse=direction == -1)
@@ -307,7 +326,10 @@ class Connection:
     def _execute_find(self, parts: QueryParts) -> CursorState:
         proj = None
         columns: list[str] | None = None
-        if parts.projection:
+        if parts.projection_paths:
+            proj = {path: 1 for path, _ in parts.projection_paths}
+            columns = [alias for _, alias in parts.projection_paths]
+        elif parts.projection:
             proj = {field: 1 for field in parts.projection}
             columns = parts.projection
         logger.debug(
@@ -330,7 +352,19 @@ class Connection:
             columns = sorted(docs[0].keys())
         rows = []
         for doc in docs:
-            row = tuple(_convert_value(doc.get(col)) for col in columns or [])
+            if parts.projection_paths:
+                def _get_path(doc: dict, path: str) -> Any:
+                    current = doc
+                    for seg in path.split("."):
+                        if isinstance(current, dict):
+                            current = current.get(seg)
+                        else:
+                            current = None
+                    return _convert_value(current)
+
+                row = tuple(_get_path(doc, path) for path, _ in parts.projection_paths)
+            else:
+                row = tuple(_convert_value(doc.get(col)) for col in columns or [])
             rows.append(row)
         description = None
         if columns:
