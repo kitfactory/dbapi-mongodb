@@ -5,7 +5,7 @@ import pytest
 from mongo_dbapi import MongoDbApiError, connect
 from bson import ObjectId
 import datetime
-from sqlalchemy import create_engine, text, Table, Column, Integer, String, MetaData, select
+from sqlalchemy import create_engine, text, Table, Column, Integer, String, MetaData, select, Index
 import decimal
 import uuid
 
@@ -256,6 +256,25 @@ def test_sqlalchemy_core_update_delete():
         conn.execute(users.delete().where(users.c.id == 1))
         rows = conn.execute(select(users.c.id).where(users.c.id == 1)).all()
     assert rows == []
+    metadata.drop_all(engine)
+
+
+def test_sqlalchemy_core_table_crud_with_index():
+    engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
+    metadata = MetaData()
+    users = Table(
+        "core_users3",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String(50)),
+    )
+    idx = users.indexes.add(Index("ix_core_users3_name", users.c.name))
+    metadata.drop_all(engine)
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(users.insert().values(id=10, name="Idx"))
+        rows = conn.execute(select(users.c.id, users.c.name).where(users.c.id == 10)).all()
+        assert rows == [(10, "Idx")]
     metadata.drop_all(engine)
 
 
