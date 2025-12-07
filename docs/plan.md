@@ -18,9 +18,9 @@
 - [x] ORM 経由の実通信テスト（リレーションなし）を追加
 
 ## P3: async dialect（Core CRUD 相当）
-- [ ] Core CRUD/DDL/Index を async でラップする dialect を設計・実装（現行 sync をスレッドプールラップで提供し、将来 motor 等のネイティブ async を検討）
-- [ ] 非同期実通信テスト（CRUD/DDL/Index）を 4.4 環境で追加（トランザクションは 4.x のみ有効、3.6 は no-op と明記）
-- [ ] README に async の対応範囲/注意点（スレッドプールラップ・トランザクション期待値・保証レベル）を追記し、FastAPI サンプルを掲載
+- [x] Core CRUD/DDL/Index を async でラップする dialect を設計・実装（現行 sync をスレッドプールラップで提供し、将来 motor 等のネイティブ async を検討）
+- [x] 非同期実通信テスト（CRUD/DDL/Index）を 4.4 環境で追加（トランザクションは 4.x のみ有効、3.6 は no-op と明記）
+- [x] README に async の対応範囲/注意点（スレッドプールラップ・トランザクション期待値・保証レベル）を追記し、FastAPI サンプルを掲載
 
 ## P4: Mongo 5+ ウィンドウ関数（低優先度）
 - [ ] Mongo 5+ 環境で `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` に変換する経路を実装
