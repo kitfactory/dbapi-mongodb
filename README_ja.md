@@ -1,10 +1,10 @@
-# mongodb-dbapi (日本語)
+# mongo-dbapi (日本語)
 
 MongoDB に対して限定的な SQL を DBAPI 風に実行するアダプターです。SQL を Mongo クエリに変換し、`pymongo`（MongoDB 3.6 互換のため 3.13.x 系）と `SQLGlot` を利用します。
 
 既存の DB-API / SQLAlchemy Core / FastAPI ベースのコードから、MongoDB を「もうひとつの方言」として扱うことを目的としています。
 
-- PyPI パッケージ名: `mongodb-dbapi`
+- PyPI パッケージ名: `mongo-dbapi`
 - モジュール名: `mongo_dbapi`
 
 ## 特長
@@ -28,8 +28,8 @@ MongoDB に対して限定的な SQL を DBAPI 風に実行するアダプター
 
 ## インストール
 ```bash
-pip install mongodb-dbapi
-# （任意）仮想環境を使う場合: python -m venv .venv && . .venv/bin/activate && pip install mongodb-dbapi
+pip install mongo-dbapi
+# （任意）仮想環境を使う場合: python -m venv .venv && . .venv/bin/activate && pip install mongo-dbapi
 ```
 
 ## 同梱 MongoDB 3.6 の起動

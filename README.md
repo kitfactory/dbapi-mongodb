@@ -1,10 +1,10 @@
-# mongodb-dbapi
+# mongo-dbapi
 
 DBAPI-style adapter that lets you execute a limited subset of SQL against MongoDB by translating SQL to Mongo queries. Built on `pymongo` (3.13.x for MongoDB 3.6 compatibility) and `SQLGlot`.
 
 Purpose: let existing DB-API / SQLAlchemy Core / FastAPI code treat MongoDB as “just another dialect.”
 
-- PyPI package name: `mongodb-dbapi`
+- PyPI package name: `mongo-dbapi`
 - Module import name: `mongo_dbapi`
 
 ## Features
@@ -29,8 +29,8 @@ Purpose: let existing DB-API / SQLAlchemy Core / FastAPI code treat MongoDB as �
 
 ## Installation
 ```bash
-pip install mongodb-dbapi
-# (optional) with a virtualenv: python -m venv .venv && . .venv/bin/activate && pip install mongodb-dbapi
+pip install mongo-dbapi
+# (optional) with a virtualenv: python -m venv .venv && . .venv/bin/activate && pip install mongo-dbapi
 ```
 
 ## Start local MongoDB (bundled 3.6)
