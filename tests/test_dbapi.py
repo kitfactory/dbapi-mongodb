@@ -86,6 +86,15 @@ def test_parameter_mismatch_raises():
     conn.close()
 
 
+def test_parameter_extra_raises():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELECT * FROM users WHERE id = %s", (1, 2))
+    assert "[mdb][E4]" in str(exc.value)
+    conn.close()
+
+
 def test_or_query():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
@@ -408,6 +417,15 @@ def test_window_function_other_than_row_number_is_rejected():
     cur = conn.cursor()
     with pytest.raises(MongoDbApiError):
         cur.execute("SELECT id, RANK() OVER (ORDER BY id) FROM users")
+    conn.close()
+
+
+def test_parse_error_returns_e5():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELCT * FROM users")
+    assert "[mdb][E5]" in str(exc.value)
     conn.close()
 
 
