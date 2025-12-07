@@ -25,7 +25,7 @@
 ## P4: Mongo 5+ ウィンドウ関数（低優先度）
 - [ ] Mongo 5+ 環境で `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` に変換する経路を実装
 - [ ] Mongo 5 未満では `[mdb][E2]` を返すことをテスト
-- [ ] MongoDB 7.x を `mongodb-7.x` に配置し、`start7xdb.sh`（レプリカセット・libssl 対応）で起動する
+- [x] MongoDB 7.x を `mongodb-7.x` に配置し、`start7xdb.sh`（レプリカセット・libssl 対応）で起動する
 - [ ] PORT=27029 などで 7.x を起動し、ウィンドウ関数テスト（ROW_NUMBER など）を追加して 7.x で成功、5 未満では `[mdb][E2]` を確認する
 - [ ] README/spec に「ウィンドウ関数は MongoDB 5.x+ 対応、7.x で動作確認予定」を明記する
 

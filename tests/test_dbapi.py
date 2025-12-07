@@ -429,3 +429,15 @@ def test_binary_and_uuid():
     assert row[0] == str(uid)
     assert row[1] == "AQID"
     conn.close()
+
+
+@pytest.mark.skipif(os.environ.get("SKIP_WINDOW", "0") == "1", reason="Window functions not supported on this MongoDB")
+def test_window_row_number():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (1, "A"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (2, "A"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (3, "B"))
+    with pytest.raises(MongoDbApiError):
+        cur.execute("SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id) AS rn FROM users")
+    conn.close()
