@@ -510,28 +510,28 @@ def _parse_join_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPar
         prefix = f"__join{idx}"
         alias_map[join_alias] = f"{prefix}."
         alias_map[join_table] = f"{prefix}."
-        join_prefixes.append((prefix, join_table, left_field, right_field, join_expr))
+        join_prefixes.append((prefix, join_table, left_field, right_field, join_expr, on_expr.left))
 
     where_filter = None
     if expr.args.get("where"):
         where_filter = _condition_to_filter_alias(expr.args["where"].this, params_map, alias_map)
 
-    for prefix, join_table, left_field, right_field, join_expr in join_prefixes:
+    for prefix, join_table, left_field, right_field, join_expr, left_expr in join_prefixes:
         join_side = (join_expr.args.get("side") or "").upper()
         preserve_null = bool(join_side == "LEFT" or (join_expr.kind and join_expr.kind.upper() == "LEFT"))
         pipeline.append(
             {
                 "$lookup": {
                     "from": join_table,
-                    "localField": left_field,
+                    "localField": _field_with_alias(left_expr, alias_map),
                     "foreignField": right_field,
                     "as": prefix,
                 }
             }
         )
         pipeline.append({"$unwind": {"path": f"${prefix}", "preserveNullAndEmptyArrays": preserve_null}})
-        if where_filter:
-            pipeline.append({"$match": where_filter})
+    if where_filter:
+        pipeline.append({"$match": where_filter})
 
     if expr.args.get("order"):
         sort_doc: dict[str, int] = {}
@@ -599,27 +599,28 @@ def _parse_group_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPa
     final_order: list[str] = []
     seen_outputs: list[str] = []
     for exp_item in expr.expressions:
+        target = exp_item.this if isinstance(exp_item, exp.Alias) else exp_item
         alias = exp_item.alias_or_name
         if alias in seen_outputs:
             continue
         seen_outputs.append(alias)
         final_order.append(alias)
-        if isinstance(exp_item, exp.Column):
-            col_name = _field_name(exp_item, params_map)
+        if isinstance(target, exp.Column):
+            col_name = _field_name(target, params_map)
             agg_fields[alias] = {"$first": f"${col_name}"}
-        elif isinstance(exp_item, exp.Count):
+        elif isinstance(target, exp.Count):
             agg_fields[alias] = {"$sum": 1}
-        elif isinstance(exp_item, exp.Sum):
-            col_name = _field_name(exp_item.this, params_map)
+        elif isinstance(target, exp.Sum):
+            col_name = _field_name(target.this, params_map)
             agg_fields[alias] = {"$sum": f"${col_name}"}
-        elif isinstance(exp_item, exp.Avg):
-            col_name = _field_name(exp_item.this, params_map)
+        elif isinstance(target, exp.Avg):
+            col_name = _field_name(target.this, params_map)
             agg_fields[alias] = {"$avg": f"${col_name}"}
-        elif isinstance(exp_item, exp.Min):
-            col_name = _field_name(exp_item.this, params_map)
+        elif isinstance(target, exp.Min):
+            col_name = _field_name(target.this, params_map)
             agg_fields[alias] = {"$min": f"${col_name}"}
-        elif isinstance(exp_item, exp.Max):
-            col_name = _field_name(exp_item.this, params_map)
+        elif isinstance(target, exp.Max):
+            col_name = _field_name(target.this, params_map)
             agg_fields[alias] = {"$max": f"${col_name}"}
         else:
             raise_error("[mdb][E2]", "Unsupported SQL construct: GROUP_SELECT")

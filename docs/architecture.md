@@ -13,7 +13,7 @@
 - `connect(uri: str, db_name: str, **kwargs) -> Connection`
 - `class Connection:`  
   - `cursor() -> Cursor`  
-  - `begin() -> None` / `commit() -> None` / `rollback() -> None`（セッションを内部に保持。開始時にサーバーのトランザクション対応可否をチェックし、非対応なら [mdb][E6]）  
+  - `begin() -> None` / `commit() -> None` / `rollback() -> None`（セッションを内部に保持。開始時にサーバーのトランザクション対応可否をチェックし、非対応なら no-op）  
   - `close() -> None`  
   - `list_tables() -> list[str]`
 - `class Cursor:`  
@@ -30,7 +30,7 @@
 
 ## エラー/ログ方針
 - エラーは `MongoDbApiError`（独自例外）を基点に、Error ID をメッセージ先頭に付与（例: `[mdb][E2] Unsupported SQL construct: JOIN`）。
-- トランザクション開始時に `hello`/`isMaster`/`server_info` などで対応状況を判定し、未対応環境（例: MongoDB 3.6）は no-op で成功扱いとし、`commit`/`rollback` もエラーにしない。
+- トランザクション開始時に `hello`/`isMaster`/`server_info` などで対応状況を判定し、未対応環境（例: MongoDB 3.6）は no-op で成功扱いとし、`commit`/`rollback` もエラーにしない。MongoDB 4.x 以降のレプリカセットではセッションを張って実際に commit/rollback を行う（4.x 系ではトランザクションをサポートすることを必須要件とする）。
 - 接続失敗/認証失敗は [mdb][E7]/[mdb][E8] で返し、元例外を cause に保持する。
 - ログは DEBUG レベルのみで出力し、実行クエリ概要と変換後クエリ詳細を記録する。デフォルト INFO ではログを出さない。PII はログに含めない。
 - 例外チェーンは保持し、呼び出し側が元例外を辿れるよう `__cause__` を設定。
@@ -46,7 +46,7 @@
 
 ## 設定と環境
 - 環境変数（例）: `MONGODB_URI`（接続先 URI）、`MONGODB_DB`（デフォルト DB 名）。`.env.sample` は作成せず、必要なら `.env` を手元で用意する。
-- トランザクションを利用する場合、レプリカセット/トランザクション対応クラスタであることを前提とし、非対応環境では [mdb][E5] で失敗させる。
+- トランザクションを利用する場合、レプリカセット/トランザクション対応クラスタ（MongoDB 4.x 以降）であることを前提とし、非対応環境では no-op で成功扱いとする（安全ガードとしてはログのみ）。4.x 系で接続した場合は begin/commit/rollback が実際に動作することを担保する。
 
 ## データフロー
 1. `connect` で MongoClient と DB を初期化し、Connection を返す。  

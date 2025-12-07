@@ -12,6 +12,7 @@ wheels/
 # Local MongoDB binaries and runtime artifacts
 mongodb-linux-*/
 mongodb-3.6/
+mongodb-4.4/
 mongodb-*.tgz
 data/
 logs/
