@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Mapping, Sequence
 import base64
 import decimal
@@ -152,6 +152,8 @@ class Connection:
         return self._db.list_collection_names()
 
     def _execute_parts(self, parts: QueryParts) -> CursorState:
+        if parts.subqueries:
+            parts = self._materialize_subqueries(parts)
         if parts.operation == "find":
             return self._execute_find(parts)
         if parts.operation == "insert":
@@ -177,6 +179,38 @@ class Connection:
                 raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
             raise_error("[mdb][E2]", "Unsupported SQL construct: WINDOW_FUNCTION")
         raise_error("[mdb][E2]")
+
+    def _materialize_subqueries(self, parts: QueryParts) -> QueryParts:
+        """Execute subqueries and substitute placeholders / サブクエリを実行し置換"""
+        resolved: dict[str, Any] = {}
+        for token, spec in (parts.subqueries or {}).items():
+            sub_parts: QueryParts = spec["parts"]
+            mode = spec.get("mode")
+            state = self._execute_parts(sub_parts)
+            if mode == "values":
+                resolved[token] = [row[0] for row in (state.rows or [])]
+            elif mode == "exists":
+                resolved[token] = bool(state.rows)
+            else:
+                resolved[token] = state.rows or []
+
+        def _replace(obj: Any) -> Any:
+            if isinstance(obj, str) and obj in resolved:
+                return resolved[obj]
+            if isinstance(obj, list):
+                return [_replace(v) for v in obj]
+            if isinstance(obj, dict):
+                return {k: _replace(v) for k, v in obj.items()}
+            return obj
+
+        return replace(
+            parts,
+            filter=_replace(parts.filter),
+            pipeline=_replace(parts.pipeline),
+            values=_replace(parts.values),
+            update=_replace(parts.update),
+            subqueries=None,
+        )
 
     def _execute_find(self, parts: QueryParts) -> CursorState:
         proj = None

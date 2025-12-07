@@ -2,12 +2,13 @@
 旧版の詳細タスクは `docs/plan1.bck` に退避済み。拡張機能（P1: Core 強化 → P2: ORM 最小 CRUD → P3: async dialect → P4: Mongo 5+ ウィンドウ関数）を進めるための作業計画。
 
 ## 共通準備
-- [ ] 4.4 レプリカセットを起動（`PORT=27019 ./start4xdb.sh`）し、`MONGODB_URI`/`MONGODB_DB` を環境変数で指定
-- [ ] テスト環境の LD_LIBRARY_PATH（`mongodb-4.4/libssl1.1/usr/lib/x86_64-linux-gnu`）を確認
+- [x] 4.4 レプリカセットを起動（`PORT=27019 ./start4xdb.sh`）し、`MONGODB_URI`/`MONGODB_DB` を環境変数で指定
+- [x] テスト環境の LD_LIBRARY_PATH（`mongodb-4.4/libssl1.1/usr/lib/x86_64-linux-gnu`）を確認
 
 ## P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）
 - [ ] Core 向け CRUD/DDL/Index の翻訳パスを実装（Table/Column ベース）
-- [ ] サブクエリ（WHERE IN/EXISTS、FROM サブクエリ）を実行して結果を置換する実通信テストを追加
+- [x] サブクエリ（WHERE IN/EXISTS）を先行実行し結果を置換する実通信テストを追加
+- [ ] FROM サブクエリを先行実行する経路と実通信テストを追加
 - [ ] UNION ALL、HAVING、等価 JOIN 多段（最大 3 段）の実通信テストを追加
 - [ ] ILIKE/正規表現リテラル、名前付きパラメータ（dict）、型拡張（Decimal/UUID/tz datetime/Binary）の実装とテスト
 - [ ] SQLAlchemy Core 経由の CRUD/DDL/Index 結合テストを 4.4 環境で通す

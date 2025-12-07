@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Mapping
+from dataclasses import replace
 
 from sqlglot import parse_one, exp
 
@@ -42,6 +43,7 @@ class QueryParts:
     index_name: str | None = None
     unique: bool = False
     union_parts: List["QueryParts"] | None = None
+    subqueries: dict[str, dict[str, Any]] | None = None
 
 
 def preprocess_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None) -> tuple[str, list[Any], list[str]]:
@@ -79,7 +81,29 @@ def preprocess_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None) -
     return new_sql, params_seq, tokens
 
 
-def _literal_value(node: exp.Expression, params_map: dict[str, Any]) -> Any:
+def _register_subquery(
+    sub_expr: exp.Expression, params_map: dict[str, Any], parent_subqueries: dict[str, dict[str, Any]], mode: str
+) -> str:
+    """Register subquery and return placeholder token / サブクエリを登録しトークンを返す"""
+    # Collect nested subqueries separately to keep scopes isolated
+    sub_collector: dict[str, dict[str, Any]] = {}
+    if isinstance(sub_expr, exp.Subquery):
+        sub_expr = sub_expr.this
+    inner_select = getattr(sub_expr, "this", None)
+    if not isinstance(sub_expr, exp.Select) and isinstance(inner_select, exp.Select):
+        sub_expr = inner_select
+    if not isinstance(sub_expr, exp.Select):
+        raise_error("[mdb][E2]", "Unsupported SQL construct: SUBQUERY")
+    sub_parts = _parse_select_like(sub_expr, params_map, sub_collector)
+    sub_parts.subqueries = sub_collector or None
+    token = f"__subquery_{len(parent_subqueries)}__"
+    parent_subqueries[token] = {"parts": sub_parts, "mode": mode}
+    return token
+
+
+def _literal_value(
+    node: exp.Expression, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]
+) -> Any:
     """Extract value from SQLGlot expression / SQLGlot 式から値を取得"""
     if isinstance(node, exp.Literal):
         if node.is_string:
@@ -93,8 +117,10 @@ def _literal_value(node: exp.Expression, params_map: dict[str, Any]) -> Any:
         if name in params_map:
             return params_map[name]
         raise_error("[mdb][E2]", "Unsupported SQL construct: COLUMN_AS_VALUE")
+    if isinstance(node, (exp.Subquery, exp.Select)):
+        return _register_subquery(node, params_map, subqueries, mode="values")
     if isinstance(node, exp.Tuple):
-        return [_literal_value(e, params_map) for e in node.expressions]
+        return [_literal_value(e, params_map, subqueries) for e in node.expressions]
     raise_error("[mdb][E2]")
 
 
@@ -156,54 +182,76 @@ def _like_to_regex(pattern: str) -> str:
     return f"^{escaped}$"
 
 
-def _condition_to_filter(node: exp.Expression, params_map: dict[str, Any]) -> Dict[str, Any]:
+def _condition_to_filter(
+    node: exp.Expression, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]
+) -> Dict[str, Any]:
     """Convert WHERE expression to Mongo filter / WHERE を Mongo フィルタへ変換"""
     if isinstance(node, exp.And):
         parts = []
         if node.expressions:
-            parts = [_condition_to_filter(e, params_map) for e in node.expressions]
+            parts = [_condition_to_filter(e, params_map, subqueries) for e in node.expressions]
         else:
-            parts = [_condition_to_filter(node.this, params_map), _condition_to_filter(node.expression, params_map)]
+            parts = [
+                _condition_to_filter(node.this, params_map, subqueries),
+                _condition_to_filter(node.expression, params_map, subqueries),
+            ]
         return {"$and": parts}
     if isinstance(node, exp.Or):
         parts = []
         if node.expressions:
-            parts = [_condition_to_filter(e, params_map) for e in node.expressions]
+            parts = [_condition_to_filter(e, params_map, subqueries) for e in node.expressions]
         else:
-            parts = [_condition_to_filter(node.this, params_map), _condition_to_filter(node.expression, params_map)]
+            parts = [
+                _condition_to_filter(node.this, params_map, subqueries),
+                _condition_to_filter(node.expression, params_map, subqueries),
+            ]
         return {"$or": parts}
     if isinstance(node, exp.Between):
         field = _field_name(node.this, params_map)
-        low = _literal_value(node.args["low"], params_map)
-        high = _literal_value(node.args["high"], params_map)
+        low = _literal_value(node.args["low"], params_map, subqueries)
+        high = _literal_value(node.args["high"], params_map, subqueries)
         return {field: {"$gte": low, "$lte": high}}
     if isinstance(node, exp.Like):
         field = _field_name(node.this, params_map)
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         if not isinstance(value, str):
             raise_error("[mdb][E2]", "Unsupported SQL construct: LIKE")
         regex = _like_to_regex(value)
         return {field: {"$regex": regex}}
     if hasattr(exp, "ILike") and isinstance(node, getattr(exp, "ILike")):
         field = _field_name(node.this, params_map)
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         regex = _like_to_regex(str(value))
         return {field: {"$regex": regex, "$options": "i"}}
     if hasattr(exp, "Regex") and isinstance(node, getattr(exp, "Regex")):
         field = _field_name(node.this, params_map)
-        pattern = _literal_value(node.expression, params_map)
+        pattern = _literal_value(node.expression, params_map, subqueries)
         return {field: {"$regex": str(pattern)}}
     if isinstance(node, exp.In):
         field = _field_name(node.this, params_map)
-        values = _literal_value(node.expression, params_map)
+        expr_val = node.expression or node.args.get("query") or node.args.get("expressions")
+        if isinstance(expr_val, (exp.Subquery, exp.Select)) or (
+            isinstance(expr_val, exp.Expression) and expr_val.find(exp.Select)
+        ):
+            token = _register_subquery(expr_val, params_map, subqueries, mode="values")
+            values = token
+        else:
+            if isinstance(expr_val, list):
+                values = [_literal_value(v, params_map, subqueries) for v in expr_val]
+            else:
+                values = _literal_value(expr_val, params_map, subqueries)
         return {field: {"$in": values}}
+    if isinstance(node, exp.Exists):
+        sub_expr = node.this
+        token = _register_subquery(sub_expr, params_map, subqueries, mode="exists")
+        return {"$expr": {"$literal": token}}
     if isinstance(node, exp.Paren):
-        return _condition_to_filter(node.this, params_map)
+        return _condition_to_filter(node.this, params_map, subqueries)
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         left = node.left
         right = node.right
         field = _field_name(left, params_map)
-        value = _literal_value(right, params_map)
+        value = _literal_value(right, params_map, subqueries)
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -219,39 +267,41 @@ def _condition_to_filter(node: exp.Expression, params_map: dict[str, Any]) -> Di
     raise_error("[mdb][E2]")
 
 
-def _condition_to_filter_join(node: exp.Expression, params_map: dict[str, Any], allowed_table: str) -> Dict[str, Any]:
+def _condition_to_filter_join(
+    node: exp.Expression, params_map: dict[str, Any], allowed_table: str, subqueries: dict[str, dict[str, Any]]
+) -> Dict[str, Any]:
     """WHERE for JOIN: only allow columns from allowed_table / JOIN の WHERE は左テーブルのみ許可"""
     if isinstance(node, exp.And):
         filters = []
         if node.expressions:
-            filters = [_condition_to_filter_join(e, params_map, allowed_table) for e in node.expressions]
+            filters = [_condition_to_filter_join(e, params_map, allowed_table, subqueries) for e in node.expressions]
         else:
             filters = [
-                _condition_to_filter_join(node.this, params_map, allowed_table),
-                _condition_to_filter_join(node.expression, params_map, allowed_table),
+                _condition_to_filter_join(node.this, params_map, allowed_table, subqueries),
+                _condition_to_filter_join(node.expression, params_map, allowed_table, subqueries),
             ]
         return {"$and": filters}
     if isinstance(node, exp.Or):
         filters = []
         if node.expressions:
-            filters = [_condition_to_filter_join(e, params_map, allowed_table) for e in node.expressions]
+            filters = [_condition_to_filter_join(e, params_map, allowed_table, subqueries) for e in node.expressions]
         else:
             filters = [
-                _condition_to_filter_join(node.this, params_map, allowed_table),
-                _condition_to_filter_join(node.expression, params_map, allowed_table),
+                _condition_to_filter_join(node.this, params_map, allowed_table, subqueries),
+                _condition_to_filter_join(node.expression, params_map, allowed_table, subqueries),
             ]
         return {"$or": filters}
     if isinstance(node, exp.In):
         tbl, field = _column_table_field(node.this)
         if tbl and tbl != allowed_table:
             raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_WHERE_RIGHT_TABLE")
-        values = _literal_value(node.expression, params_map)
+        values = _literal_value(node.expression, params_map, subqueries)
         return {field: {"$in": values}}
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         tbl, field = _column_table_field(node.left)
         if tbl and tbl != allowed_table:
             raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_WHERE_RIGHT_TABLE")
-        value = _literal_value(node.right, params_map)
+        value = _literal_value(node.right, params_map, subqueries)
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -265,82 +315,79 @@ def _condition_to_filter_join(node: exp.Expression, params_map: dict[str, Any], 
         if isinstance(node, exp.LTE):
             return {field: {"$lte": value}}
     if isinstance(node, exp.Paren):
-        return _condition_to_filter_join(node.this, params_map, allowed_table)
+        return _condition_to_filter_join(node.this, params_map, allowed_table, subqueries)
     if isinstance(node, exp.Between):
         tbl, field = _column_table_field(node.this)
         if tbl and tbl != allowed_table:
             raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_WHERE_RIGHT_TABLE")
-        low = _literal_value(node.args["low"], params_map)
-        high = _literal_value(node.args["high"], params_map)
+        low = _literal_value(node.args["low"], params_map, subqueries)
+        high = _literal_value(node.args["high"], params_map, subqueries)
         return {field: {"$gte": low, "$lte": high}}
     if isinstance(node, exp.Like):
         tbl, field = _column_table_field(node.this)
         if tbl and tbl != allowed_table:
             raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_WHERE_RIGHT_TABLE")
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         regex = _like_to_regex(str(value))
         return {field: {"$regex": regex}}
     if hasattr(exp, "ILike") and isinstance(node, getattr(exp, "ILike")):
         tbl, field = _column_table_field(node.this)
         if tbl and tbl != allowed_table:
             raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_WHERE_RIGHT_TABLE")
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         regex = _like_to_regex(str(value))
         return {field: {"$regex": regex, "$options": "i"}}
-    if isinstance(node, exp.Or):
-        filters = [_condition_to_filter_join(e, params_map, allowed_table) for e in node.expressions]
-        return {"$or": filters}
-    if isinstance(node, exp.Or) or isinstance(node, exp.Between) or isinstance(node, exp.Like):
-        raise_error("[mdb][E2]")
     raise_error("[mdb][E2]")
 
 
-def _condition_to_filter_alias(node: exp.Expression, params_map: dict[str, Any], alias_map: dict[str, str]) -> Dict[str, Any]:
+def _condition_to_filter_alias(
+    node: exp.Expression, params_map: dict[str, Any], alias_map: dict[str, str], subqueries: dict[str, dict[str, Any]]
+) -> Dict[str, Any]:
     """WHERE with alias prefixes / エイリアス付き WHERE を Mongo フィルタへ変換"""
     if isinstance(node, exp.And):
         parts = []
         if node.expressions:
-            parts = [_condition_to_filter_alias(e, params_map, alias_map) for e in node.expressions]
+            parts = [_condition_to_filter_alias(e, params_map, alias_map, subqueries) for e in node.expressions]
         else:
             parts = [
-                _condition_to_filter_alias(node.this, params_map, alias_map),
-                _condition_to_filter_alias(node.expression, params_map, alias_map),
+                _condition_to_filter_alias(node.this, params_map, alias_map, subqueries),
+                _condition_to_filter_alias(node.expression, params_map, alias_map, subqueries),
             ]
         return {"$and": parts}
     if isinstance(node, exp.Or):
         parts = []
         if node.expressions:
-            parts = [_condition_to_filter_alias(e, params_map, alias_map) for e in node.expressions]
+            parts = [_condition_to_filter_alias(e, params_map, alias_map, subqueries) for e in node.expressions]
         else:
             parts = [
-                _condition_to_filter_alias(node.this, params_map, alias_map),
-                _condition_to_filter_alias(node.expression, params_map, alias_map),
+                _condition_to_filter_alias(node.this, params_map, alias_map, subqueries),
+                _condition_to_filter_alias(node.expression, params_map, alias_map, subqueries),
             ]
         return {"$or": parts}
     if isinstance(node, exp.Between):
         field = _field_with_alias(node.this, alias_map)
-        low = _literal_value(node.args["low"], params_map)
-        high = _literal_value(node.args["high"], params_map)
+        low = _literal_value(node.args["low"], params_map, subqueries)
+        high = _literal_value(node.args["high"], params_map, subqueries)
         return {field: {"$gte": low, "$lte": high}}
     if isinstance(node, exp.Like):
         field = _field_with_alias(node.this, alias_map)
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         regex = _like_to_regex(str(value))
         return {field: {"$regex": regex}}
     if hasattr(exp, "ILike") and isinstance(node, getattr(exp, "ILike")):
         field = _field_with_alias(node.this, alias_map)
-        value = _literal_value(node.expression, params_map)
+        value = _literal_value(node.expression, params_map, subqueries)
         regex = _like_to_regex(str(value))
         return {field: {"$regex": regex, "$options": "i"}}
     if isinstance(node, exp.In):
         field = _field_with_alias(node.this, alias_map)
-        values = _literal_value(node.expression, params_map)
+        values = _literal_value(node.expression, params_map, subqueries)
         return {field: {"$in": values}}
     if isinstance(node, exp.Paren):
-        return _condition_to_filter_alias(node.this, params_map, alias_map)
+        return _condition_to_filter_alias(node.this, params_map, alias_map, subqueries)
     if isinstance(node, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
         field = _field_with_alias(node.left, alias_map)
-        value = _literal_value(node.right, params_map)
+        value = _literal_value(node.right, params_map, subqueries)
         if isinstance(node, exp.EQ):
             return {field: value}
         if isinstance(node, exp.NEQ):
@@ -358,7 +405,7 @@ def _condition_to_filter_alias(node: exp.Expression, params_map: dict[str, Any],
 
 def _ensure_supported(expr: exp.Expression) -> None:
     """Reject unsupported constructs early / 非対応構文を早期に検出"""
-    unsupported = (exp.Or, exp.Between, exp.Like, exp.Offset, exp.Subquery)
+    unsupported = (exp.Or, exp.Between, exp.Like, exp.Offset)
     for node in expr.walk():
         if isinstance(node, unsupported):
             keyword = node.key.upper() if hasattr(node, "key") else node.__class__.__name__
@@ -369,6 +416,7 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
     """Parse SQL to QueryParts / SQL を QueryParts に変換"""
     normalized_sql, param_values, tokens = preprocess_sql(sql, params)
     params_map = {tokens[i]: val for i, val in enumerate(param_values)}
+    subqueries: dict[str, dict[str, Any]] = {}
     # Handle CREATE/DROP INDEX via simple parser
     ci = _parse_create_index_sql(normalized_sql)
     if ci:
@@ -384,8 +432,8 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
     if isinstance(expr, exp.Union):
         if expr.args.get("distinct"):
             raise_error("[mdb][E2]", "Unsupported SQL construct: UNION DISTINCT")
-        left = _parse_select_like(expr.left, params_map)
-        right = _parse_select_like(expr.right, params_map)
+        left = _parse_select_like(expr.left, params_map, subqueries)
+        right = _parse_select_like(expr.right, params_map, subqueries)
         order = None
         limit = None
         if expr.args.get("order"):
@@ -399,7 +447,9 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
                 limit = int(expr.args["limit"].expression.name)
             except Exception:
                 limit = int(expr.args["limit"].expression.this)
-        return QueryParts(operation="union_all", collection="", union_parts=[left, right], sort=order, limit=limit)
+        parts = QueryParts(operation="union_all", collection="", union_parts=[left, right], sort=order, limit=limit)
+        parts.subqueries = subqueries or None
+        return parts
 
     if isinstance(expr, exp.Select):
         # window function detection
@@ -408,16 +458,25 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
             collection = table.name if table and table.name else ""
             return QueryParts(operation="window", collection=collection)
         if expr.args.get("joins"):
-            return _parse_join_select(expr, params_map)
-        if expr.args.get("group"):
-            return _parse_group_select(expr, params_map)
-        return _parse_select(expr, params_map)
+            parts = _parse_join_select(expr, params_map, subqueries)
+        elif expr.args.get("group"):
+            parts = _parse_group_select(expr, params_map, subqueries)
+        else:
+            parts = _parse_select(expr, params_map, subqueries)
+        parts.subqueries = subqueries or None
+        return parts
     if isinstance(expr, exp.Insert):
-        return _parse_insert(expr, params_map)
+        parts = _parse_insert(expr, params_map, subqueries)
+        parts.subqueries = subqueries or None
+        return parts
     if isinstance(expr, exp.Update):
-        return _parse_update(expr, params_map)
+        parts = _parse_update(expr, params_map, subqueries)
+        parts.subqueries = subqueries or None
+        return parts
     if isinstance(expr, exp.Delete):
-        return _parse_delete(expr, params_map)
+        parts = _parse_delete(expr, params_map, subqueries)
+        parts.subqueries = subqueries or None
+        return parts
     if isinstance(expr, exp.Create):
         return _parse_create(expr)
     if isinstance(expr, exp.Drop):
@@ -425,7 +484,7 @@ def parse_sql(sql: str, params: Sequence[Any] | Mapping[str, Any] | None = None)
     raise_error("[mdb][E2]", "Unsupported SQL construct: STATEMENT")
 
 
-def _parse_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
+def _parse_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     table = expr.find(exp.Table)
     if not table or not table.name:
         raise_error("[mdb][E5]", "Failed to parse SQL")
@@ -436,7 +495,7 @@ def _parse_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
 
     mongo_filter = None
     if expr.args.get("where"):
-        mongo_filter = _condition_to_filter(expr.args["where"].this, params_map)
+        mongo_filter = _condition_to_filter(expr.args["where"].this, params_map, subqueries)
 
     sort_items = None
     if expr.args.get("order"):
@@ -470,15 +529,15 @@ def _parse_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
     )
 
 
-def _parse_select_like(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
+def _parse_select_like(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     if expr.args.get("joins"):
-        return _parse_join_select(expr, params_map)
+        return _parse_join_select(expr, params_map, subqueries)
     if expr.args.get("group"):
-        return _parse_group_select(expr, params_map)
-    return _parse_select(expr, params_map)
+        return _parse_group_select(expr, params_map, subqueries)
+    return _parse_select(expr, params_map, subqueries)
 
 
-def _parse_join_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
+def _parse_join_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     from_expr = expr.args.get("from_")
     joins = expr.args.get("joins") or []
     if not from_expr or not hasattr(from_expr, "this") or not from_expr.this.name or len(joins) < 1:
@@ -514,7 +573,7 @@ def _parse_join_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPar
 
     where_filter = None
     if expr.args.get("where"):
-        where_filter = _condition_to_filter_alias(expr.args["where"].this, params_map, alias_map)
+        where_filter = _condition_to_filter_alias(expr.args["where"].this, params_map, alias_map, subqueries)
 
     for prefix, join_table, left_field, right_field, join_expr, left_expr in join_prefixes:
         join_side = (join_expr.args.get("side") or "").upper()
@@ -576,13 +635,13 @@ def _parse_join_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPar
     )
 
 
-def _parse_group_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryParts:
+def _parse_group_select(expr: exp.Select, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     table = expr.find(exp.Table)
     if not table or not table.name:
         raise_error("[mdb][E5]", "Failed to parse SQL")
     pipeline: list[dict] = []
     if expr.args.get("where"):
-        where_filter = _condition_to_filter(expr.args["where"].this, params_map)
+        where_filter = _condition_to_filter(expr.args["where"].this, params_map, subqueries)
         pipeline.append({"$match": where_filter})
     group_fields = expr.args.get("group")
     if not group_fields:
@@ -632,7 +691,7 @@ def _parse_group_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPa
     having_filter = None
     if expr.args.get("having"):
         alias_map = {k: "" for k in list(group_cols) + list(agg_fields.keys())}
-        having_filter = _condition_to_filter_alias(expr.args["having"].this, params_map, alias_map)
+        having_filter = _condition_to_filter_alias(expr.args["having"].this, params_map, alias_map, subqueries)
 
     project_doc: dict[str, str] = {}
     for key in final_order:
@@ -674,7 +733,7 @@ def _parse_group_select(expr: exp.Select, params_map: dict[str, Any]) -> QueryPa
     )
 
 
-def _parse_insert(expr: exp.Insert, params_map: dict[str, Any]) -> QueryParts:
+def _parse_insert(expr: exp.Insert, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     table_expr = expr.this
     columns: List[str] = []
     table_name = None
@@ -691,7 +750,7 @@ def _parse_insert(expr: exp.Insert, params_map: dict[str, Any]) -> QueryParts:
     if len(values_exp.expressions) != 1:
         raise_error("[mdb][E5]", "Failed to parse SQL")
     row = values_exp.expressions[0]
-    values = [_literal_value(v, params_map) for v in row.expressions]
+    values = [_literal_value(v, params_map, subqueries) for v in row.expressions]
     if columns and len(columns) != len(values):
         raise_error("[mdb][E4]")
     doc = dict(zip(columns, values)) if columns else dict(enumerate(values))
@@ -702,7 +761,7 @@ def _parse_insert(expr: exp.Insert, params_map: dict[str, Any]) -> QueryParts:
     )
 
 
-def _parse_update(expr: exp.Update, params_map: dict[str, Any]) -> QueryParts:
+def _parse_update(expr: exp.Update, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     table = expr.this
     if not table or not table.name:
         raise_error("[mdb][E5]", "Failed to parse SQL")
@@ -712,12 +771,12 @@ def _parse_update(expr: exp.Update, params_map: dict[str, Any]) -> QueryParts:
         if not isinstance(assign, exp.EQ):
             raise_error("[mdb][E5]")
         field = _field_name(assign.left, params_map)
-        value = _literal_value(assign.right, params_map)
+        value = _literal_value(assign.right, params_map, subqueries)
         assignments[field] = value
     where_clause = expr.args.get("where")
     if not where_clause:
         raise_error("[mdb][E3]")
-    mongo_filter = _condition_to_filter(where_clause.this, params_map)
+    mongo_filter = _condition_to_filter(where_clause.this, params_map, subqueries)
     return QueryParts(
         operation="update",
         collection=table.name,
@@ -726,14 +785,14 @@ def _parse_update(expr: exp.Update, params_map: dict[str, Any]) -> QueryParts:
     )
 
 
-def _parse_delete(expr: exp.Delete, params_map: dict[str, Any]) -> QueryParts:
+def _parse_delete(expr: exp.Delete, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> QueryParts:
     table = expr.this if hasattr(expr, "this") else None
     if not table or not table.name:
         raise_error("[mdb][E5]", "Failed to parse SQL")
     where_clause = expr.args.get("where")
     if not where_clause:
         raise_error("[mdb][E3]")
-    mongo_filter = _condition_to_filter(where_clause.this, params_map)
+    mongo_filter = _condition_to_filter(where_clause.this, params_map, subqueries)
     return QueryParts(
         operation="delete",
         collection=table.name,

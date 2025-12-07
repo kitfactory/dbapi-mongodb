@@ -265,3 +265,30 @@ def test_window_function_is_rejected():
     with pytest.raises(MongoDbApiError):
         cur.execute("SELECT id, ROW_NUMBER() OVER (PARTITION BY name) FROM users")
     conn.close()
+
+
+def test_subquery_in_select():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (1, "A"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (2, "B"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (3, "C"))
+    cur.execute("SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE id >= %s)", (2,))
+    rows = sorted(cur.fetchall())
+    assert rows == [(2,), (3,)]
+    conn.close()
+
+
+def test_subquery_exists_as_boolean_gate():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (1, "A"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (2, "B"))
+    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (3, "C"))
+    cur.execute("SELECT id FROM users WHERE EXISTS (SELECT 1 FROM users WHERE name = %s)", ("B",))
+    rows_exists = sorted(cur.fetchall())
+    assert rows_exists == [(1,), (2,), (3,)]
+    cur.execute("SELECT id FROM users WHERE EXISTS (SELECT 1 FROM users WHERE name = %s)", ("Z",))
+    rows_none = cur.fetchall()
+    assert rows_none == []
+    conn.close()

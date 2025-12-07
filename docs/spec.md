@@ -64,6 +64,11 @@
 - 条件: `cursor.execute(sql)`
 - 振る舞い: `$group` に変換し、集計結果を返す（COUNT/SUM/AVG/MIN/MAX をサポート）。HAVING は未対応。
 
+### 2.8. WHERE IN/EXISTS のサブクエリを先行実行して適用する (F11)
+- 前提: `SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE score >= 10)` または `WHERE EXISTS (SELECT 1 FROM users WHERE active = true)`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: サブクエリを先に実行し、先頭列の結果リストで `$in` を構築する。`EXISTS` はサブクエリ件数 > 0 なら真、0 件なら偽として評価する（非相関サブクエリのみサポート）。
+
 ## 3. DML 変換 (F3)
 ### 3.1. INSERT が insert_one に変換される (F3)
 - 前提: `INSERT INTO users (id, name) VALUES (1, 'Alice')`
@@ -174,7 +179,7 @@
 
 ## 11. 拡張機能（F11/F12）
 - P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index を実通信で通す）  
-  - サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)`、`FROM (SELECT ...) AS t` をサポート（スカラサブクエリは非対応）。サブクエリを先行実行し結果リストで置換する。  
+  - サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)` を先行実行し、結果リスト/存在可否で置換する（非相関のみ）。`FROM (SELECT ...) AS t` は拡張対象（スカラサブクエリは非対応）。  
   - UNION/UNION ALL: `UNION ALL` のみサポート（重複除去は [mdb][E2]）。ORDER/LIMIT は全体にのみ適用。  
   - HAVING: GROUP BY 後の比較/AND/OR/IN/BETWEEN/LIKE を `$match` として適用（非集計列を含む HAVING は [mdb][E2]）。  
   - JOIN 拡張: 等価 JOIN の多段（最大 3 段）。非等価 JOIN、RIGHT/FULL OUTER は当面 [mdb][E2]。  
