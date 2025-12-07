@@ -7,7 +7,7 @@
 - 結果整形層: `pymongo` の返却値を DBAPI 互換の行タプル/カウントに整形。JOIN 時は `$lookup` の結果をフラット化して返す。
 - エラー整形層: 例外を Error ID 付きメッセージにマッピングし、仕様で定義した文字列を返す。
 
-依存方向は左から右へのみ（DBAPI → 翻訳 → クライアント → 結果/エラー）。ユーティリティ/定数は下位でのみ共有し、循環を禁止する。SQL パーサーは `SQLGlot` を使用し、`SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE/INDEX`、`WHERE`（比較/AND/OR/IN/BETWEEN/LIKE）、`ORDER BY`、`LIMIT/OFFSET`、INNER/LEFT 等価 JOIN（2 段まで）、`GROUP BY`+集計に対応し、将来のサブクエリ対応を見据える。LIKE は `%`/`_` を `$regex` に変換し、大文字小文字は区別。
+依存方向は左から右へのみ（DBAPI → 翻訳 → クライアント → 結果/エラー）。ユーティリティ/定数は下位でのみ共有し、循環を禁止する。SQL パーサーは `SQLGlot` を使用し、`SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE/INDEX`、`WHERE`（比較/AND/OR/IN/BETWEEN/LIKE）、`ORDER BY`、`LIMIT/OFFSET`、INNER/LEFT 等価 JOIN（2 段まで）、`GROUP BY`+集計、`UNION ALL`、`HAVING` に対応し、サブクエリ対応を見据える。LIKE は `%`/`_` を `$regex` に変換し、大文字小文字は区別（ILIKE/正規表現リテラルは拡張項目）。
 
 ## 主要インターフェース（案）
 - `connect(uri: str, db_name: str, **kwargs) -> Connection`
@@ -41,7 +41,7 @@
 - プレースホルダーは `%s` と `%(name)s` に対応（不足/余剰は [mdb][E4]）。
 - `autocommit` はデフォルト ON 相当で、`begin()` 呼び出し時のみセッションを張る（未対応環境では no-op）。
 - SQLAlchemy 方言を提供し、モジュール属性（apilevel/threadsafety/paramstyle=pyformat、スキーム `mongodb+dbapi://`）を設定する。Core の text() ベースで確認済み、Table/Column 互換と ORM CRUD は今後拡張、async dialect はロードマップ上で検討。
-- 今後の拡張: サブクエリ/UNION/HAVING/非等価・多段 JOIN/ウィンドウ関数の翻訳パスを追加し、Decimal/UUID/tz datetime など型変換のポリシーを明確化する。
+- 拡張機能: サブクエリ/UNION/HAVING/非等価・多段 JOIN/ILIKE・正規表現リテラル/名前付きパラメータ/ウィンドウ関数の翻訳パスを追加し、Decimal/UUID/tz datetime など型変換のポリシーを明確化する。
 - 優先実装順: 1) SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）、2) ORM 最小 CRUD、3) async dialect（Core CRUD 基準）、4) ウィンドウ関数（Mongo 5+ 前提）。
 
 ## 設定と環境

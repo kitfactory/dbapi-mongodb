@@ -172,13 +172,15 @@
 - トランザクションは MongoDB 4.0+ でのみ有効化し、3.6 では no-op で成功扱いとする。
 - ウィンドウ関数を含むクエリは MongoDB 5.0 未満では `[mdb][E2] Unsupported SQL construct: WINDOW_FUNCTION` を返す。
 
-## 11. 今後の対応予定（F11/F12）
-- サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)`、`FROM (SELECT ...) AS t` をサポートする（スカラサブクエリは非対応）。サブクエリを先行実行し結果リストで置換する。
-- UNION/UNION ALL: `UNION ALL` をサポート（重複除去は非対応で [mdb][E2]）。ORDER/LIMIT は全体にのみ適用。
-- HAVING: GROUP BY 後の比較/AND/OR/IN/BETWEEN/LIKE を `$match` として適用する（非集計列を含む HAVING は [mdb][E2]）。
-- JOIN 拡張: 等価 JOIN の多段（最大 3 段）をサポート。非等価 JOIN、RIGHT/FULL OUTER は当面非対応（[mdb][E2]）。
-- ウィンドウ関数: `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` で対応（Mongo 5.0 未満は [mdb][E2]）。その他のウィンドウ関数は非対応。
-- 文字列マッチ: `ILIKE` を大小区別なし `$regex` に変換。`/pattern/` の正規表現リテラルも `$regex` で対応。
-- 名前付きパラメータ: `%(name)s` を受け付け、dict パラメータを必須にする。不足/余剰は [mdb][E4]。
-- 型拡張: Decimal/UUID は文字列化、tz 付き datetime はそのまま返却、Binary は base64 文字列化。未対応型は文字列化する。
-- 優先実装順: 1) SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index）、2) ORM 最小 CRUD、3) async dialect（Core CRUD）、4) ウィンドウ関数（Mongo 5+）。
+## 11. 拡張機能（F11/F12）
+- P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index を実通信で通す）  
+  - サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)`、`FROM (SELECT ...) AS t` をサポート（スカラサブクエリは非対応）。サブクエリを先行実行し結果リストで置換する。  
+  - UNION/UNION ALL: `UNION ALL` のみサポート（重複除去は [mdb][E2]）。ORDER/LIMIT は全体にのみ適用。  
+  - HAVING: GROUP BY 後の比較/AND/OR/IN/BETWEEN/LIKE を `$match` として適用（非集計列を含む HAVING は [mdb][E2]）。  
+  - JOIN 拡張: 等価 JOIN の多段（最大 3 段）。非等価 JOIN、RIGHT/FULL OUTER は当面 [mdb][E2]。  
+  - 文字列マッチ拡張: `ILIKE` を大小区別なし `$regex`、`/pattern/` の正規表現リテラルも `$regex` で対応。  
+  - 名前付きパラメータ: `%(name)s` を dict で受け、不足/余剰は [mdb][E4]。  
+  - 型拡張: Decimal/UUID は文字列化、tz 付き datetime はそのまま返却、Binary は base64 文字列化。未対応型は文字列化。  
+- P2: ORM 最小 CRUD（単一テーブル相当の add/get/select/update/delete。PK を `_id` にマッピングし、リレーション/JOIN は当面対象外）  
+- P3: async dialect（Core CRUD/DDL/Index を async でラップ。トランザクション方針は同期と同じ）  
+- P4: Mongo 5+ 拡張（低優先度。`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` で対応。Mongo 5.0 未満は [mdb][E2]。その他のウィンドウ関数は非対応）

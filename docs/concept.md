@@ -29,11 +29,15 @@ Python から MongoDB を SQL 風に扱うための DBAPI ライブラリ。`pym
 - JOIN は INNER/LEFT の等価結合（複合キー含む、2 段まで）をサポートし、それ以外は未対応エラーで扱う。将来的に SQLAlchemy 方言での利用を想定。
 - WHERE は `OR`、`LIKE`（%/ _ を `$regex` に変換）、`BETWEEN` を追加対応し、集計 (`GROUP BY` + 集約関数) を `$group` にマッピングする。
 - トランザクションは 3.6 など未対応環境では no-op で成功扱いとし、4.x 以降でセッションを張る。
-- 今後の優先対応: サブクエリ/UNION/HAVING、非等価/多段 JOIN、ウィンドウ関数、ILIKE/正規表現リテラル、名前付きパラメータ、型拡張（Decimal/UUID/tz datetime）。
+- パラメータバインドは `%s` と `%(name)s` を受け付け、dict/sequence で適用する（不足/余剰はエラー）。
+- 拡張機能（P1→P4 の順）:  
+  - P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index を実通信で通すため、サブクエリ/UNION ALL/HAVING/多段 JOIN/ILIKE・正規表現リテラル、名前付きパラメータ、型拡張を揃える）  
+  - P2: ORM 最小 CRUD（単一テーブル相当、PK→`_id` マッピング、P1 の型/パラメータを流用）  
+  - P3: async dialect（Core CRUD/DDL/Index を async 化、トランザクション方針は同じ）  
+  - P4: Mongo 5+ 前提のウィンドウ関数対応（`ROW_NUMBER` など）
 - トランザクションは MongoDB のレプリカセット/トランザクション対応クラスタを前提（Phase2）。
 - MongoDB のバージョン/構成でトランザクションが未サポートの場合は実行前に検出し、明示的にエラー返却する。
-- SQL サポート範囲（MVP 案）: `SELECT/INSERT/UPDATE/DELETE`、`WHERE` の単純比較と `AND`、`IN`、`ORDER BY`、`LIMIT` のみ対応。`OR`/`BETWEEN`/`LIKE`/`OFFSET` などは未対応扱いとする。
-- パラメータバインドは `%s` の位置パラメータのみを受け付け、名前付きプレースホルダーは未対応。
+- SQL サポート範囲（現状）: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`、`CREATE/DROP INDEX`、`WHERE`（比較/`AND`/`OR`/`IN`/`BETWEEN`/`LIKE`）、`ORDER BY`、`LIMIT/OFFSET`、INNER/LEFT 等価 JOIN（複合キー/2 段）、`GROUP BY` + 集計、`UNION ALL`、`HAVING`。
 - 将来拡張: SQLGlot を採用することでサブクエリやより複雑な構文にも対応する余地を残す（Phase2 以降で検討）。
 
 ## 使用するライブラリ
