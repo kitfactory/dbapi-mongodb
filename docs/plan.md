@@ -30,9 +30,9 @@
 - [x] README/spec に「ウィンドウ関数は MongoDB 5.x+ 対応、7.x で動作確認済み」を明記する
 
 ## P5: JOIN/CASE/HAVING alias 強化
-- [ ] JOIN 投影を解禁する（JOIN_PROJECTION の制限を緩和し、JOIN 先列を別名含めて投影可能にする）。安全性のため制限事項を明文化。
-- [ ] JOIN + WHERE/HAVING で alias 解決を強化する（JOIN したテーブルの別名をフィルタ/集約で扱えるようにする）。
-- [ ] CASE を含む単純な集計（`SUM(CASE WHEN status='done' THEN 1 ELSE 0 END)` など）を `$cond` でサポートする。
+- [x] JOIN 投影を解禁する（JOIN_PROJECTION の制限を緩和し、JOIN 先列を別名含めて投影可能にする）。安全性のため制限事項を明文化。
+- [x] JOIN + WHERE/HAVING で alias 解決を強化する（JOIN したテーブルの別名をフィルタ/集約で扱えるようにする）。
+- [x] CASE を含む単純な集計（`SUM(CASE WHEN status='done' THEN 1 ELSE 0 END)` など）を `$cond` でサポートする。
 - [ ] HAVING で集計 alias を解決する（例: `HAVING SUM(total) >= 100` を集計結果に対して評価）。
 - [ ] 仕様/spec/README に対応範囲と制限（複雑な CASE/ネストは対象外など）を追記し、テストを追加する。
 
