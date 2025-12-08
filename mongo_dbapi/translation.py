@@ -127,6 +127,8 @@ def _literal_value(
         if name in params_map:
             return params_map[name]
         raise_error("[mdb][E2]", "Unsupported SQL construct: COLUMN_AS_VALUE")
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
     if isinstance(node, (exp.Subquery, exp.Select)):
         return _register_subquery(node, params_map, subqueries, mode="values")
     if isinstance(node, exp.Tuple):
@@ -147,6 +149,8 @@ def _field_name(node: exp.Expression, params_map: dict[str, Any]) -> str:
         return node.this
     if isinstance(node, exp.Column) and node.name in params_map:
         raise_error("[mdb][E2]", "Unsupported SQL construct: PARAM_AS_FIELD")
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)) and node.alias_or_name:
+        return node.alias_or_name
     raise_error("[mdb][E2]")
 
 
@@ -170,6 +174,9 @@ def _field_with_alias(node: exp.Expression, alias_map: dict[str, str]) -> str:
         if not tbl:
             # default to base alias (empty prefix)
             return f"{alias_map.get('', '')}{fld}"
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)) and node.alias_or_name:
+        # allow aggregate alias in HAVING/ORDER for grouped queries
+        return node.alias_or_name
     raise_error("[mdb][E2]")
 
 
@@ -190,6 +197,35 @@ def _like_to_regex(pattern: str) -> str:
             escaped += re.escape(ch)
         i += 1
     return f"^{escaped}$"
+
+
+def _case_to_cond(case_expr: exp.Case, params_map: dict[str, Any], subqueries: dict[str, dict[str, Any]]) -> Any:
+    """Convert a simple CASE WHEN ... THEN ... ELSE ... END to $cond / 簡易 CASE を $cond に変換"""
+    whens = case_expr.args.get("ifs") or []
+    default = case_expr.args.get("default")
+    # Support single WHEN branch only
+    if not whens:
+        raise_error("[mdb][E2]", "Unsupported SQL construct: CASE")
+    when = whens[0]
+    cond = when.this
+    then_expr = when.expression
+    else_expr = default or exp.Literal.number(0)
+    # Only support equality comparison for condition
+    if isinstance(cond, exp.EQ):
+        left = _field_name(cond.left, params_map)
+        right = _literal_value(cond.right, params_map, subqueries)
+        condition = {"$eq": [f"${left}", right]}
+    else:
+        raise_error("[mdb][E2]", "Unsupported SQL construct: CASE")
+    try:
+        then_val = _literal_value(then_expr, params_map, subqueries)
+    except Exception:
+        then_val = getattr(then_expr, "this", None)
+    try:
+        else_val = _literal_value(else_expr, params_map, subqueries)
+    except Exception:
+        else_val = getattr(else_expr, "this", None)
+    return {"$cond": [condition, then_val, else_val]}
 
 
 def _condition_to_filter(
@@ -778,13 +814,15 @@ def _parse_join_select(expr: exp.Select, params_map: dict[str, Any], subqueries:
     if not expr.is_star:
         projection_paths = []
         for c in expr.expressions:
-            if isinstance(c, exp.Column):
-                tbl, fld = _column_table_field(c)
+            target = c.this if isinstance(c, exp.Alias) else c
+            out_name = c.alias_or_name or (target.alias_or_name if isinstance(target, exp.Column) else None)
+            if isinstance(target, exp.Column):
+                tbl, fld = _column_table_field(target)
                 if tbl and tbl not in alias_map:
                     raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_COLUMN")
-                path = _field_with_alias(c, alias_map)
-                out_name = c.alias_or_name or (f"{tbl}.{fld}" if tbl and tbl != base_collection else fld)
-                projection_paths.append((path, out_name))
+                path = _field_with_alias(target, alias_map)
+                out = out_name or (f"{tbl}.{fld}" if tbl and tbl != base_collection else fld)
+                projection_paths.append((path, out))
             else:
                 raise_error("[mdb][E2]", "Unsupported SQL construct: JOIN_PROJECTION")
     return QueryParts(
@@ -830,8 +868,11 @@ def _parse_group_select(expr: exp.Select, params_map: dict[str, Any], subqueries
         elif isinstance(target, exp.Count):
             agg_fields[alias] = {"$sum": 1}
         elif isinstance(target, exp.Sum):
-            col_name = _field_name(target.this, params_map)
-            agg_fields[alias] = {"$sum": f"${col_name}"}
+            if isinstance(target.this, exp.Case):
+                agg_fields[alias] = {"$sum": _case_to_cond(target.this, params_map, subqueries)}
+            else:
+                col_name = _field_name(target.this, params_map)
+                agg_fields[alias] = {"$sum": f"${col_name}"}
         elif isinstance(target, exp.Avg):
             col_name = _field_name(target.this, params_map)
             agg_fields[alias] = {"$avg": f"${col_name}"}

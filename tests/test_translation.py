@@ -96,10 +96,11 @@ def test_where_like_ilike_regex():
 
 def test_join_inner_and_left():
     parts_inner = parse_sql(
-        "SELECT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id"
+        "SELECT u.id, o.id as oid FROM users u JOIN orders o ON u.id = o.user_id"
     )
     assert parts_inner.operation == "aggregate"
     assert any("$lookup" in stage for stage in parts_inner.pipeline or [])
+    assert ("__join0.id", "oid") in (parts_inner.projection_paths or [])
     parts_left = parse_sql(
         "SELECT u.id, o.id FROM users u LEFT JOIN orders o ON u.id = o.user_id"
     )
@@ -111,6 +112,19 @@ def test_group_by_and_having():
     assert parts.operation == "aggregate"
     assert any("$group" in stage for stage in parts.pipeline or [])
     assert any("$match" in stage for stage in parts.pipeline or [])
+
+
+def test_sum_case_aggregate():
+    parts = parse_sql(
+        "SELECT user_id, SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_count FROM tasks GROUP BY user_id"
+    )
+    assert parts.operation == "aggregate"
+    cond_sum = None
+    for stage in parts.pipeline or []:
+        if "$group" in stage:
+            cond_sum = stage["$group"].get("done_count")
+            break
+    assert cond_sum and "$cond" in cond_sum.get("$sum", {})
 
 
 def test_union_all_parts():
