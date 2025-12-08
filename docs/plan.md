@@ -39,6 +39,8 @@
 ## P6: ウィンドウ関数拡張（検討）
 - [ ] ROW_NUMBER 以外の基本ウィンドウ関数（`RANK/DENSE_RANK` など）について、MongoDB 5+ 前提で実装可否を調査・方針化する。
 - [ ] 実装する場合は `$setWindowFields` で変換し、非対応の場合は `[mdb][E2]` で明示する。
+- [ ] 調査タスク: MongoDB の `$setWindowFields` で利用可能なウィンドウ演算子（`$rank`, `$denseRank` など）と制約を整理し、実装対象/除外を決定する。
+- [ ] 翻訳・テストタスク: 対象とするウィンドウ関数の翻訳パスとテストケース（5.x+ で成功、5 未満で `[mdb][E2]`）を追加する。
 
 ## ドキュメント/仕様の更新
 - [x] 実装に合わせて `docs/spec.md` / `docs/architecture.md` / `README*` を更新
