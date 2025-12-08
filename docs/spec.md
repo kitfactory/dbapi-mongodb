@@ -1,7 +1,7 @@
 # dbapi-mongodb 仕様
 
 ## 前提: サポートする SQL 構文（拡張後）
-- 対応: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`（コレクション作成/削除）、`CREATE/DROP INDEX`、`WHERE` の比較 (`=`/`<>`/`>`/`<`/`<=`/`>=`)、`AND`、`OR`、`IN`、`BETWEEN`、`LIKE`（`%`/`_` を `$regex` に変換）、`ILIKE`、正規表現リテラル、`ORDER BY`、`LIMIT`、`OFFSET`、INNER/LEFT JOIN の等価結合（複合キー、最大 3 段）、`GROUP BY` + 集約（COUNT/SUM/AVG/MIN/MAX）+ `HAVING`、`UNION ALL`、サブクエリ（`WHERE IN/EXISTS`、`FROM (SELECT ...)`）、`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`（MongoDB 5.x+）
+- 対応: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`（コレクション作成/削除）、`CREATE/DROP INDEX`、`WHERE` の比較 (`=`/`<>`/`>`/`<`/`<=`/`>=`)、`AND`、`OR`、`IN`、`BETWEEN`、`LIKE`（`%`/`_` を `$regex` に変換）、`ILIKE`、正規表現リテラル、`ORDER BY`、`LIMIT`、`OFFSET`、INNER/LEFT JOIN の等価結合（複合キー、最大 3 段）、`GROUP BY` + 集約（COUNT/SUM/AVG/MIN/MAX）+ `HAVING`（集計 alias を解決）、`UNION ALL`、サブクエリ（`WHERE IN/EXISTS`、`FROM (SELECT ...)`）、`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`（MongoDB 5.x+）、簡易 CASE 集計（`SUM(CASE WHEN ... THEN ... ELSE ... END)` の単一 WHEN）
 - 強化予定（P5/P6）: JOIN 投影/alias 解決の強化、CASE を含む集計 (`SUM(CASE WHEN ... THEN ... ELSE ... END)`)、HAVING での集計 alias 解決、ROW_NUMBER 以外の基本ウィンドウ関数（MongoDB 5+ 前提）の検討。
 - 非対応: 非等価 JOIN、フル/右外部 JOIN、`ROW_NUMBER` 以外のウィンドウ関数、MongoDB 5 未満でのウィンドウ関数、`UNION`（重複除去）。
 - プレースホルダー: `%s` と `%(name)s` の両方に対応（不足/余剰は `[mdb][E4]`）。
