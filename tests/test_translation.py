@@ -127,6 +127,19 @@ def test_sum_case_aggregate():
     assert cond_sum and "$cond" in cond_sum.get("$sum", {})
 
 
+def test_having_sum_without_alias():
+    parts = parse_sql("SELECT user_id, SUM(total) FROM orders GROUP BY user_id HAVING SUM(total) >= 100")
+    assert parts.operation == "aggregate"
+    assert any("$group" in stage for stage in parts.pipeline or [])
+    assert any("$match" in stage for stage in parts.pipeline or [])
+
+
+def test_having_with_aggregate_alias():
+    parts = parse_sql("SELECT user_id, SUM(total) AS total_sum FROM orders GROUP BY user_id HAVING total_sum >= 100")
+    assert parts.operation == "aggregate"
+    assert any("$match" in stage for stage in parts.pipeline or [])
+
+
 def test_union_all_parts():
     parts = parse_sql("SELECT id FROM users UNION ALL SELECT id FROM archived_users")
     assert parts.operation == "union_all"

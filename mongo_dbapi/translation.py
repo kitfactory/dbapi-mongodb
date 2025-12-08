@@ -151,6 +151,11 @@ def _field_name(node: exp.Expression, params_map: dict[str, Any]) -> str:
         raise_error("[mdb][E2]", "Unsupported SQL construct: PARAM_AS_FIELD")
     if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)) and node.alias_or_name:
         return node.alias_or_name
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        if hasattr(node, "this") and node.this:
+            base = _field_name(node.this, params_map)
+            return f"{node.__class__.__name__.lower()}_{base}"
+        return f"{node.__class__.__name__.lower()}_{len(params_map)}"
     raise_error("[mdb][E2]")
 
 
@@ -171,12 +176,22 @@ def _field_with_alias(node: exp.Expression, alias_map: dict[str, str]) -> str:
             return f"{alias_map[tbl]}{fld}"
         if not tbl and "" in alias_map:
             return f"{alias_map['']}{fld}"
-        if not tbl:
-            # default to base alias (empty prefix)
-            return f"{alias_map.get('', '')}{fld}"
-    if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)) and node.alias_or_name:
-        # allow aggregate alias in HAVING/ORDER for grouped queries
-        return node.alias_or_name
+        if not tbl and fld in alias_map:
+            return f"{alias_map.get(fld, '')}{fld}"
+        raise_error("[mdb][E2]")
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        alias = node.alias_or_name
+        if not alias and hasattr(node, "this") and node.this:
+            base = None
+            if isinstance(node.this, exp.Column):
+                base = node.this.name
+            elif isinstance(node.this, exp.Identifier):
+                base = node.this.name
+            alias = f"{node.__class__.__name__.lower()}_{base or '0'}"
+        if alias:
+            if alias_map and alias in alias_map:
+                return alias
+            return alias
     raise_error("[mdb][E2]")
 
 
@@ -857,7 +872,20 @@ def _parse_group_select(expr: exp.Select, params_map: dict[str, Any], subqueries
     seen_outputs: list[str] = []
     for exp_item in expr.expressions:
         target = exp_item.this if isinstance(exp_item, exp.Alias) else exp_item
-        alias = exp_item.alias_or_name
+        alias = exp_item.alias_or_name or getattr(target, "alias_or_name", None) or None
+        if not alias:
+            if isinstance(target, (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max)):
+                base_name = None
+                if hasattr(target, "this") and target.this:
+                    try:
+                        base_name = _field_name(target.this, params_map)
+                    except Exception:
+                        base_name = target.__class__.__name__.lower()
+                alias = f"{target.__class__.__name__.lower()}_{base_name or len(agg_fields)}"
+            elif isinstance(target, exp.Column):
+                alias = _field_name(target, params_map)
+            else:
+                alias = f"agg_{len(agg_fields)}"
         if alias in seen_outputs:
             continue
         seen_outputs.append(alias)
