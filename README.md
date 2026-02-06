@@ -7,9 +7,14 @@ Purpose: let existing DB-API / SQLAlchemy Core / FastAPI code treat MongoDB as �
 - PyPI package name: `dbapi-mongodb`
 - Module import name: `mongo_dbapi`
 
+## Release Policy (Join-first / MongoDB 4.4)
+- This release locks on **practical JOIN compatibility** first, targeting MongoDB 4.4.
+- Guaranteed JOIN scope: INNER/LEFT (up to 3 hops, composite ON, non-equi ON), RIGHT OUTER (single JOIN, equality ON), FULL OUTER (single JOIN, equality ON), JOIN with `ORDER BY`/`LIMIT`/`OFFSET`, and JOIN + `GROUP BY/HAVING` (A27 pattern: `COALESCE(...) + COUNT(*)`).
+- Other advanced SQL features remain available where implemented, but further hardening is treated as future work. Unsupported cases return `[mdb][E2]`.
+
 ## Features
 - DBAPI-like `Connection`/`Cursor`
-- SQL → Mongo: `SELECT/INSERT/UPDATE/DELETE`, `CREATE/DROP TABLE/INDEX` (ASC/DESC, UNIQUE, composite), `WHERE` (comparisons/`AND`/`OR`/`IN`/`BETWEEN`/`LIKE`→`$regex`/`ILIKE`/regex literal), `ORDER BY`, `LIMIT/OFFSET`, INNER/LEFT JOIN (equijoin, composite keys up to 3 hops, projection/alias), `GROUP BY` + aggregates (COUNT/SUM/AVG/MIN/MAX) + `HAVING` (aggregate aliases), simple CASE aggregates (`SUM(CASE WHEN ... THEN ... ELSE ... END)`), `UNION ALL`, subqueries (`WHERE IN/EXISTS`, `FROM (SELECT ...)`), window functions `ROW_NUMBER`/`RANK`/`DENSE_RANK` on MongoDB 5.x+
+- SQL → Mongo: `SELECT/INSERT/UPDATE/DELETE`, `CREATE/DROP TABLE/INDEX` (ASC/DESC, UNIQUE, composite), `WHERE` (comparisons/`AND`/`OR`/`IN`/`BETWEEN`/`LIKE`/`ILIKE`/regex literal), `ORDER BY`, `LIMIT/OFFSET`, JOIN (INNER/LEFT up to 3 hops with composite/non-equi ON, RIGHT/FULL OUTER for single JOIN with equality ON), `GROUP BY` + aggregates + `HAVING` (including FULL OUTER A27 pattern), simple CASE aggregates (`SUM(CASE WHEN ... THEN ... ELSE ... END)`), `UNION ALL/UNION` (multi-branch), subqueries (`WHERE IN/EXISTS/NOT EXISTS`, scalar subquery in comparisons, `FROM (SELECT ...)`), non-recursive `WITH` CTE
 - `%s` positional and `%(name)s` named parameters; unsupported constructs raise Error IDs (e.g. `[mdb][E2]`)
 - Error IDs for common failures: invalid URI, unsupported SQL, unsafe DML without WHERE, parse errors, connection/auth failures
 - DBAPI fields: `rowcount`, `lastrowid`, `description` (column order: explicit order, or alpha for `SELECT *`; JOIN uses left→right)
@@ -63,13 +68,14 @@ print(cur.rowcount)    # 1
 ## Supported SQL
 - Statements: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`
 - WHERE: comparisons (`=`, `<>`, `>`, `<`, `<=`, `>=`), `AND`, `OR`, `IN`, `BETWEEN`, `LIKE` (`%`/`_` → `$regex`), `ILIKE`, regex literal `/.../`
-- JOIN: INNER/LEFT equijoin (composite keys, up to 3 joins)
+- JOIN: INNER/LEFT (composite ON, non-equi ON, up to 3 joins), RIGHT OUTER (single JOIN, equality ON), FULL OUTER (single JOIN, equality ON)
 - Aggregation: `GROUP BY` with COUNT/SUM/AVG/MIN/MAX and `HAVING`
-- Subqueries: `WHERE IN/EXISTS` and `FROM (SELECT ...)` (non-correlated; executed first)
-- Set ops: `UNION ALL`
-- Window: `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` on MongoDB 5.x+ (`[mdb][E2]` on earlier versions)
+- Subqueries: `WHERE IN/EXISTS/NOT EXISTS` (correlated EXISTS in limited simple form), scalar non-correlated subqueries in comparisons, and `FROM (SELECT ...)`
+- Set ops: `UNION ALL` / `UNION` (supports 3+ branches; mixed `UNION` + `UNION ALL` is rejected)
+- CTE: non-recursive `WITH`
+- Window: `ROW_NUMBER`/`RANK`/`DENSE_RANK` on MongoDB 5.x+ (`[mdb][E2]` on 4.4)
 - ORDER/LIMIT/OFFSET
-- Unsupported: non-equi joins, FULL/RIGHT OUTER, `UNION` (distinct), window functions other than `ROW_NUMBER`, correlated subqueries, ORM relationships
+- Unsupported (4.4 target): `WITH RECURSIVE`, RIGHT/FULL OUTER with non-equality ON, RIGHT/FULL join chains, complex FULL OUTER aggregate shapes (outside `COALESCE(...) + COUNT(*)`), complex correlated subqueries, mixed `UNION` + `UNION ALL`, ORM relationships
 
 ## SQLAlchemy
 - DBAPI module attributes: `apilevel="2.0"`, `threadsafety=1`, `paramstyle="pyformat"`.
@@ -102,8 +108,9 @@ async def get_user(user_id: str, conn: AsyncConnection = Depends(get_conn)):
 - Limitations: async ORM/relationship and statement cache are out of scope; heavy concurrency uses a thread pool under the hood. 
 
 ## Support levels
-- Tested/stable (real Mongo runs): single-collection CRUD, WHERE/ORDER/LIMIT/OFFSET, INNER/LEFT equijoin (up to 3 hops), GROUP BY + aggregates + HAVING, subqueries (WHERE IN/EXISTS, FROM (SELECT ...)), UNION ALL, `ROW_NUMBER()` (MongoDB 5.x+).
-- Not supported / constraints: non-equi JOIN, FULL/RIGHT OUTER, distinct `UNION`, window functions other than `ROW_NUMBER`, correlated subqueries, ORM relationships; async is thread-pool based.
+- Stable guarantee (Join-first): JOIN-heavy paths (INNER/LEFT up to 3 hops, RIGHT/FULL single JOIN constraints, JOIN + ORDER/LIMIT/OFFSET, JOIN + GROUP BY/HAVING in supported shapes) and single-collection CRUD.
+- Available as best effort: `UNION/UNION ALL`, non-recursive CTE, scalar subqueries, limited correlated EXISTS, MongoDB 5.x+ window functions.
+- Not supported / constraints: `WITH RECURSIVE`, RIGHT/FULL OUTER with non-equality ON, RIGHT/FULL join chains, complex FULL OUTER aggregate shapes, complex correlated subqueries, mixed `UNION` + `UNION ALL`, ORM relationships; async remains thread-pool based.
 
 ## Running tests
 ```bash
@@ -120,10 +127,10 @@ MONGODB_URI=mongodb://127.0.0.1:27018 MONGODB_DB=mongo_dbapi_test .venv/bin/pyte
 - Error messages are fixed strings per `docs/spec.md`. Keep logs at DEBUG only (default INFO is silent).
 
 ## Roadmap (SQL support prioritization)
-1) Non-equi/RIGHT/FULL JOIN and correlated subqueries (TBD)  
-2) DISTINCT `UNION`, more complex CASE (multiple WHEN/OR/AND)  
+1) Complex correlated subqueries and FULL OUTER aggregate generalization (beyond A27 shape)  
+2) `WITH RECURSIVE` and mixed `UNION` + `UNION ALL` chains  
 3) Additional window functions beyond ROW_NUMBER/RANK/DENSE_RANK (`LAG/LEAD/NTILE`, etc.)  
-4) Explicit performance/compat notes for large JOIN/window workloads  
+4) Performance guidance for large JOIN workloads (recommended indexes and slow-query thresholds, especially FULL OUTER)  
 If you need one of these sooner, please open an issue and share your use case.
 
 ## License

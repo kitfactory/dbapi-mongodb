@@ -7,9 +7,14 @@ MongoDB に対して限定的な SQL を DBAPI 風に実行するアダプター
 - PyPI パッケージ名: `dbapi-mongodb`
 - モジュール名: `mongo_dbapi`
 
+## リリース方針（Join-first / MongoDB 4.4）
+- 本リリースは **JOIN の実運用互換**を最優先に固定し、MongoDB 4.4 をターゲットにします。
+- JOIN の正式サポート範囲: INNER/LEFT（最大 3 段、複合 ON、非等価 ON）、RIGHT OUTER（単一 JOIN・等価 ON）、FULL OUTER（単一 JOIN・等価 ON）、JOIN 後の `ORDER BY`/`LIMIT`/`OFFSET`、JOIN + `GROUP BY/HAVING`（A27 形: `COALESCE(...) + COUNT(*)`）。
+- JOIN 以外の高度機能は「利用可能なものは維持しつつ、改善は future 優先」で進めます（未対応時は `[mdb][E2]` を返却）。
+
 ## 特長
 - `connect()` で DBAPI 風の `Connection`/`Cursor` を取得
-- SQL→Mongo 変換: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE/INDEX`（インデックスは ASC/DESC、UNIQUE、複合に対応）、`WHERE`（比較/`AND`/`OR`/`IN`/`BETWEEN`/`LIKE`→`$regex`、`ILIKE`、正規表現リテラル）、`ORDER BY`、`LIMIT/OFFSET`、INNER/LEFT JOIN（等価結合、複合キー/最大 3 段）、`GROUP BY` + 集計（COUNT/SUM/AVG/MIN/MAX）+ `HAVING`、`UNION ALL`、サブクエリ（`WHERE IN/EXISTS`、`FROM (SELECT ...)`）、`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`（MongoDB 5.x+）
+- SQL→Mongo 変換: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE/INDEX`（ASC/DESC、UNIQUE、複合）、`WHERE`（比較/`AND`/`OR`/`IN`/`BETWEEN`/`LIKE`/`ILIKE`/正規表現）、`ORDER BY`、`LIMIT/OFFSET`、JOIN（INNER/LEFT は最大 3 段の複合/非等価 ON、RIGHT/FULL OUTER は単一 JOIN の等価 ON）、`GROUP BY` + 集計 + `HAVING`（FULL OUTER の A27 形を含む）、`UNION ALL/UNION`（多段連結）、サブクエリ（`WHERE IN/EXISTS/NOT EXISTS`、比較式スカラサブクエリ、`FROM (SELECT ...)`）、`WITH`（非再帰 CTE）
 - プレースホルダーは `%s` と `%(name)s` をサポート。未対応構文は Error ID（例: `[mdb][E2]`）を返す
 - 代表的なエラー ID: URI 無効、未対応 SQL、WHERE なしの危険 DML、解析失敗、接続/認証失敗、トランザクション非対応など
 - DBAPI 項目: `rowcount`、`lastrowid`、`description`（列順は明示順、`SELECT *` はアルファベット順。JOIN 時は左→右）
@@ -62,13 +67,14 @@ print(cur.rowcount)    # 1
 ## 対応している SQL
 - ステートメント: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE/DROP INDEX`
 - WHERE: 比較演算子（`=`, `<>`, `>`, `<`, `<=`, `>=`）、`AND`、`OR`、`IN`、`BETWEEN`、`LIKE`（`%`/`_` → `$regex`）、`ILIKE`、正規表現リテラル `/.../`
-- JOIN: INNER/LEFT 等価結合（複合キー、最大 3 段、投影/alias 対応）
+- JOIN: INNER/LEFT（複合 ON、非等価 ON、最大 3 段、投影/alias 対応）、RIGHT OUTER（単一 JOIN・等価 ON）、FULL OUTER（単一 JOIN・等価 ON）
 - 集計: `GROUP BY` + 集計（COUNT/SUM/AVG/MIN/MAX）+ `HAVING`（集計 alias 解決）＋簡易 CASE 集計（`SUM(CASE WHEN ... THEN ... END)`）
-- サブクエリ: `WHERE IN/EXISTS` と `FROM (SELECT ...)`（非相関のみ、先行実行）
-- 集合: `UNION ALL`
-- ウィンドウ: `ROW_NUMBER`/`RANK`/`DENSE_RANK`（MongoDB 5.x+、それ未満は `[mdb][E2]`）
+- サブクエリ: `WHERE IN/EXISTS/NOT EXISTS`（相関 EXISTS は単純形のみ）、比較式の非相関スカラサブクエリ、`FROM (SELECT ...)`
+- 集合: `UNION ALL` / `UNION`（3 項以上の多段連結を含む。混在連結は `[mdb][E2]`）
+- CTE: `WITH`（非再帰）
+- ウィンドウ: `ROW_NUMBER`/`RANK`/`DENSE_RANK`（MongoDB 5.x+、4.4 では `[mdb][E2]`）
 - `ORDER BY`, `LIMIT`, `OFFSET`
-- 未対応: 非等価 JOIN、FULL/RIGHT OUTER、`UNION`（重複除去）、`ROW_NUMBER` 以外のウィンドウ関数、相関サブクエリ、ORM リレーション
+- 未対応（4.4）: `WITH RECURSIVE`、非等価 ON を含む RIGHT/FULL OUTER JOIN、RIGHT/FULL JOIN 連鎖、FULL OUTER 集計の複雑形（A27 形以外）、複雑な相関サブクエリ、`UNION` と `UNION ALL` の混在連結、ORM リレーション
 
 ## テスト実行
 ```bash
@@ -107,18 +113,19 @@ async def get_user(user_id: str, conn: AsyncConnection = Depends(get_conn)):
 - 制限: async ORM/relationship、statement cache は対象外。内部はスレッドプールのため高負荷時はスレッド/接続数に注意。
 
 ## 保証範囲と制約
-- 実機で安定確認済み: 単一コレクション CRUD、WHERE/ORDER/LIMIT/OFFSET、INNER/LEFT 等価 JOIN（最大 3 段）、GROUP BY + 集計 + HAVING、サブクエリ（WHERE IN/EXISTS, FROM (SELECT ...)), UNION ALL、`ROW_NUMBER`/`RANK`/`DENSE_RANK`（MongoDB 5.x+）
-- 非対応/制約: 非等価 JOIN、FULL/RIGHT OUTER、重複除去 `UNION`、`ROW_NUMBER` 以外のウィンドウ関数、相関サブクエリ、ORM リレーション。async はスレッドプール実装。
+- 安定保証（Join-first）: JOIN 系（INNER/LEFT 最大 3 段、RIGHT/FULL の単一 JOIN 制約、JOIN 後 `ORDER BY/LIMIT/OFFSET`、対応形での JOIN + 集計/HAVING）と単一コレクション CRUD。
+- 併用可能（best effort）: `UNION/UNION ALL`、CTE（非再帰）、スカラサブクエリ、相関 EXISTS（単純形）、MongoDB 5.x+ のウィンドウ関数。
+- 非対応/制約: `WITH RECURSIVE`、非等価 ON の RIGHT/FULL OUTER、RIGHT/FULL JOIN 連鎖、FULL OUTER 集計の複雑形、複雑相関サブクエリ、`UNION` と `UNION ALL` の混在連結、ORM リレーション。async はスレッドプール実装。
 
 ## 補足
 - MongoDB 3.6 などトランザクション未対応環境では `begin/commit/rollback` を no-op の成功扱いとします。4.x 以降（レプリカセット）ではセッションが有効で、同梱 4.4 で全テスト通過済みです。
 - エラーメッセージは `docs/spec.md` に定義された固定文字列です。ログは DEBUG 時のみ出力し、INFO では出しません。
 
 ## 今後の対応優先度（SQL）
-1) 非等価 JOIN / RIGHT/FULL JOIN / 相関サブクエリ  
-2) DISTINCT `UNION`、複雑な CASE（複数 WHEN/AND/OR）  
+1) 複雑相関サブクエリと FULL OUTER 集計の一般化（A27 形の拡張）  
+2) `WITH RECURSIVE`、`UNION`/`UNION ALL` 混在連結  
 3) ROW_NUMBER 系以外のウィンドウ関数（`LAG/LEAD/NTILE` など）  
-4) 大規模 JOIN・ウィンドウ利用時のパフォーマンス/制約の明示  
+4) 大規模 JOIN 向けの性能ガイド（推奨インデックス、スロークエリ判定基準。特に FULL OUTER）  
 必要な項目があれば Issue などでユースケースを共有してください。
 ## チュートリアル
 - English: `docs/tutorial.md`

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, List, Mapping, Sequence
 import base64
@@ -189,8 +190,8 @@ class Connection:
             return self._execute_create_index(parts)
         if parts.operation == "drop_index":
             return self._execute_drop_index(parts)
-        if parts.operation == "union_all":
-            return self._execute_union_all(parts)
+        if parts.operation in ("union_all", "union"):
+            return self._execute_union(parts)
         raise_error("[mdb][E2]")
 
     def _materialize_subqueries(self, parts: QueryParts) -> QueryParts:
@@ -202,6 +203,8 @@ class Connection:
             state = self._execute_parts(sub_parts)
             if mode == "values":
                 resolved[token] = [row[0] for row in (state.rows or [])]
+            elif mode == "scalar":
+                resolved[token] = state.rows[0][0] if state.rows else None
             elif mode == "exists":
                 resolved[token] = bool(state.rows)
             elif mode == "from":
@@ -222,17 +225,22 @@ class Connection:
                 return {k: _replace(v) for k, v in obj.items()}
             return obj
 
-        return replace(
-            parts,
-            filter=_replace(parts.filter),
-            pipeline=_replace(parts.pipeline),
-            values=_replace(parts.values),
-            update=_replace(parts.update),
-            subqueries=None,
-            inline_token=None if (parts.inline_token and parts.inline_token in resolved) else parts.inline_token,
-            collection=_replace(parts.collection) if isinstance(parts.collection, dict) else parts.collection,
-            inline_rows=_replace(resolved.get(parts.inline_token)) if parts.inline_token else None,
-        )
+        def _replace_parts(target: QueryParts) -> QueryParts:
+            replaced_union = [_replace_parts(p) for p in (target.union_parts or [])] or None
+            return replace(
+                target,
+                filter=_replace(target.filter),
+                pipeline=_replace(target.pipeline),
+                values=_replace(target.values),
+                update=_replace(target.update),
+                subqueries=None,
+                inline_token=None if (target.inline_token and target.inline_token in resolved) else target.inline_token,
+                collection=_replace(target.collection) if isinstance(target.collection, dict) else target.collection,
+                inline_rows=_replace(resolved.get(target.inline_token)) if target.inline_token else target.inline_rows,
+                union_parts=replaced_union,
+            )
+
+        return _replace_parts(parts)
 
     def _match_filter(self, doc: dict, flt: Any) -> bool:
         if flt is None:
@@ -248,8 +256,18 @@ class Connection:
                         return False
                     continue
                 if key == "$expr":
-                    # already reduced to literal truthy/falsey
-                    return bool(val.get("$literal"))
+                    # already reduced to literal truthy/falsey (and simple $not) /
+                    # $literal の真偽（および単純な $not）として評価済み
+                    if not isinstance(val, dict):
+                        return bool(val)
+                    if "$literal" in val:
+                        return bool(val.get("$literal"))
+                    if "$not" in val and isinstance(val.get("$not"), list) and val["$not"]:
+                        inner = val["$not"][0]
+                        if isinstance(inner, dict) and "$literal" in inner:
+                            return not bool(inner.get("$literal"))
+                        return not bool(inner)
+                    return bool(val)
                 actual = doc.get(key)
                 if isinstance(val, dict):
                     for op, expected in val.items():
@@ -316,8 +334,22 @@ class Connection:
             filtered = filtered[parts.skip :]
         if parts.limit:
             filtered = filtered[: parts.limit]
-        columns = parts.projection or (sorted(filtered[0].keys()) if filtered else [])
-        result_rows = [tuple(_convert_value(r.get(c)) for c in columns) for r in filtered]
+
+        def _get_path(doc: dict, path: str) -> Any:
+            current: Any = doc
+            for seg in path.split("."):
+                if isinstance(current, dict):
+                    current = current.get(seg)
+                else:
+                    current = None
+            return _convert_value(current)
+
+        if parts.projection_paths:
+            columns = [alias for _, alias in parts.projection_paths]
+            result_rows = [tuple(_get_path(r, path) for path, _ in parts.projection_paths) for r in filtered]
+        else:
+            columns = parts.projection or (sorted(filtered[0].keys()) if filtered else [])
+            result_rows = [tuple(_convert_value(r.get(c)) for c in columns) for r in filtered]
         description = [(c, None, None, None, None, None, None) for c in columns] if columns else None
         return CursorState(rows=result_rows, rowcount=len(result_rows), description=description)
 
@@ -416,7 +448,75 @@ class Connection:
             pass
         return CursorState(rows=[], rowcount=0)
 
-    def _execute_union_all(self, parts: QueryParts) -> CursorState:
+    def _execute_union(self, parts: QueryParts) -> CursorState:
+        is_union_distinct = parts.operation == "union"
+        optimize = os.environ.get("MONGO_DBAPI_OPTIMIZE", "1").lower() not in ("0", "false", "no")
+        if optimize and not is_union_distinct:
+            subs = parts.union_parts or []
+            if len(subs) >= 2 and all(s.operation == "find" for s in subs):
+                base = subs[0]
+                base_proj = base.projection_paths or ([(c, c) for c in (base.projection or [])] if base.projection else None)
+                if base_proj and all(
+                    (s.projection_paths or ([(c, c) for c in (s.projection or [])] if s.projection else None)) == base_proj
+                    for s in subs
+                ):
+                    pipeline: list[dict[str, Any]] = []
+                    if base.filter:
+                        pipeline.append({"$match": base.filter})
+                    project_doc: dict[str, Any] = {"_id": 0}
+                    for path, out in base_proj:
+                        project_doc[out] = f"${path}"
+                    pipeline.append({"$project": project_doc})
+                    for sub in subs[1:]:
+                        sub_proj = sub.projection_paths or ([(c, c) for c in (sub.projection or [])] if sub.projection else None)
+                        sub_pipe: list[dict[str, Any]] = []
+                        if sub.filter:
+                            sub_pipe.append({"$match": sub.filter})
+                        sub_project: dict[str, Any] = {"_id": 0}
+                        for path, out in sub_proj or []:
+                            sub_project[out] = f"${path}"
+                        sub_pipe.append({"$project": sub_project})
+                        pipeline.append({"$unionWith": {"coll": sub.collection, "pipeline": sub_pipe}})
+                    if parts.sort:
+                        sort_doc = {field: direction for field, direction in parts.sort}
+                        pipeline.append({"$sort": sort_doc})
+                    if parts.skip is not None:
+                        pipeline.append({"$skip": parts.skip})
+                    if parts.limit is not None:
+                        pipeline.append({"$limit": parts.limit})
+                    agg_parts = replace(
+                        parts,
+                        operation="aggregate",
+                        collection=base.collection,
+                        pipeline=pipeline,
+                        projection_paths=[(out, out) for _path, out in base_proj],
+                        union_parts=None,
+                    )
+                    return self._execute_aggregate(agg_parts)
+            if len(subs) >= 2 and all(s.operation == "aggregate" and s.collection for s in subs):
+                base = subs[0]
+                base_proj = base.projection_paths
+                if base_proj and all(s.projection_paths == base_proj for s in subs):
+                    pipeline = list(base.pipeline or [])
+                    for sub in subs[1:]:
+                        pipeline.append({"$unionWith": {"coll": sub.collection, "pipeline": sub.pipeline or []}})
+                    if parts.sort:
+                        sort_doc = {field: direction for field, direction in parts.sort}
+                        pipeline.append({"$sort": sort_doc})
+                    if parts.skip is not None:
+                        pipeline.append({"$skip": parts.skip})
+                    if parts.limit is not None:
+                        pipeline.append({"$limit": parts.limit})
+                    agg_parts = replace(
+                        parts,
+                        operation="aggregate",
+                        collection=base.collection,
+                        pipeline=pipeline,
+                        projection_paths=base_proj,
+                        union_parts=None,
+                    )
+                    return self._execute_aggregate(agg_parts)
+
         rows: list[tuple] = []
         description = None
         for sub in parts.union_parts or []:
@@ -424,8 +524,26 @@ class Connection:
             if description is None:
                 description = state.description
             rows.extend(state.rows or [])
+        if is_union_distinct:
+            deduped: list[tuple] = []
+            seen: set[tuple] = set()
+            for row in rows:
+                if row in seen:
+                    continue
+                seen.add(row)
+                deduped.append(row)
+            rows = deduped
         if parts.sort:
-            rows.sort(key=lambda r: tuple(r[0:len(parts.sort)]), reverse=False)
+            name_to_idx: dict[str, int] = {}
+            if description:
+                name_to_idx = {str(col[0]): idx for idx, col in enumerate(description)}
+            def _sort_key(value: Any) -> tuple[bool, Any]:
+                return (value is not None, value)
+            for field, direction in reversed(parts.sort):
+                idx = name_to_idx.get(field, 0)
+                rows.sort(key=lambda r, i=idx: _sort_key(r[i]), reverse=direction == -1)
+        if parts.skip is not None:
+            rows = rows[parts.skip :]
         if parts.limit is not None:
             rows = rows[: parts.limit]
         return CursorState(rows=rows, rowcount=len(rows), description=description)

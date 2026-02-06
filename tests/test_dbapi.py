@@ -40,12 +40,14 @@ def clean_db():
     db = conn._db  # noqa: SLF001
     db[COLLECTION].delete_many({})
     db["orders"].delete_many({})
+    db["archived_users"].delete_many({})
     db["addresses"].delete_many({})
     db["cities"].delete_many({})
     db["orm_users"].delete_many({})
     yield
     db[COLLECTION].delete_many({})
     db["orders"].delete_many({})
+    db["archived_users"].delete_many({})
     db["addresses"].delete_many({})
     db["cities"].delete_many({})
     db["orm_users"].delete_many({})
@@ -258,6 +260,501 @@ def test_named_params_and_union_all():
     cur.execute("SELECT id FROM users WHERE id = %(id)s UNION ALL SELECT id FROM users WHERE name = %(name)s", {"id": 50, "name": "NP"})
     rows = cur.fetchall()
     assert (50,) in rows
+
+
+def test_acceptance_a1_detail_orders_for_user():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (101, 10, 1, 120, datetime.datetime(2024, 1, 3, 10, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (102, 10, 1, None, datetime.datetime(2024, 1, 3, 9, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (103, 10, 1, 150, datetime.datetime(2024, 1, 2, 12, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (104, 11, 1, 999, datetime.datetime(2024, 1, 4, 0, 0, 0)),
+    )
+    sql = (
+        "SELECT o.id, o.total, o.created_at "
+        "FROM orders o "
+        "WHERE o.tenant_id = %s AND o.user_id = %s "
+        "ORDER BY o.created_at DESC, o.id ASC LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 10, 2, 0))
+    rows = cur.fetchall()
+    assert rows == [
+        (101, 120, datetime.datetime(2024, 1, 3, 10, 0, 0)),
+        (102, None, datetime.datetime(2024, 1, 3, 9, 0, 0)),
+    ]
+    conn.close()
+
+
+def test_acceptance_a2_search_distinct_not_in():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "Alice"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "Alicia"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 1, "Bob"))
+    cur.execute("INSERT INTO orders (id, user_id, status) VALUES (%s, %s, %s)", (201, 1, "new"))
+    cur.execute("INSERT INTO orders (id, user_id, status) VALUES (%s, %s, %s)", (202, 1, "cancelled"))
+    cur.execute("INSERT INTO orders (id, user_id, status) VALUES (%s, %s, %s)", (203, 2, "archived"))
+    cur.execute("INSERT INTO orders (id, user_id, status) VALUES (%s, %s, %s)", (204, 2, "new"))
+    sql = (
+        "SELECT DISTINCT u.id "
+        "FROM users u JOIN orders o ON u.id = o.user_id "
+        "WHERE u.tenant_id = %s AND u.name ILIKE %s AND o.status NOT IN (%s, %s) "
+        "ORDER BY u.id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, "a%", "cancelled", "archived", 10, 0))
+    rows = cur.fetchall()
+    assert rows == [(1,), (2,)]
+    conn.close()
+
+
+def test_acceptance_a3_group_having_order_alias():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, status, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (301, 1, "done", 10, datetime.datetime(2024, 1, 5)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, status, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (302, 1, "done", 15, datetime.datetime(2024, 1, 6)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, status, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (303, 1, "done", 20, datetime.datetime(2024, 1, 7)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, status, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (304, 1, "new", 5, datetime.datetime(2024, 1, 10)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, status, total, created_at) VALUES (%s, %s, %s, %s, %s)",
+        (305, 1, "new", 7, datetime.datetime(2024, 1, 11)),
+    )
+    sql = (
+        "SELECT o.status, COUNT(*) AS cnt, SUM(o.total) AS total_sum "
+        "FROM orders o "
+        "WHERE o.tenant_id = %s AND o.created_at BETWEEN %s AND %s "
+        "GROUP BY o.status HAVING cnt >= %s ORDER BY cnt DESC LIMIT %s"
+    )
+    cur.execute(sql, (1, datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 31), 2, 10))
+    rows = cur.fetchall()
+    assert rows == [("done", 3, 45), ("new", 2, 12)]
+    conn.close()
+    conn.close()
+
+
+def test_acceptance_a4_search_ilike_contains():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "Auser10"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "Buser21"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 1, "other"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (4, 2, "Auser10"))
+    sql = (
+        "SELECT u.id "
+        "FROM users u "
+        "WHERE u.tenant_id = %s AND u.name ILIKE %s "
+        "ORDER BY u.id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, "%user1%", 10, 0))
+    rows = cur.fetchall()
+    assert rows == [(1,)]
+    conn.close()
+
+
+def test_acceptance_a5_deep_offset_paging():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    # Insert deterministic timestamps / 時刻を固定して挿入
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, created_at) VALUES (%s, %s, %s)",
+        (1, 1, datetime.datetime(2024, 1, 3, 0, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, created_at) VALUES (%s, %s, %s)",
+        (2, 1, datetime.datetime(2024, 1, 2, 0, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, tenant_id, created_at) VALUES (%s, %s, %s)",
+        (3, 1, datetime.datetime(2024, 1, 1, 0, 0, 0)),
+    )
+    sql = (
+        "SELECT o.id, o.created_at "
+        "FROM orders o "
+        "WHERE o.tenant_id = %s "
+        "ORDER BY o.created_at DESC, o.id ASC LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 1, 1))
+    rows = cur.fetchall()
+    assert rows == [(2, datetime.datetime(2024, 1, 2, 0, 0, 0))]
+    conn.close()
+
+
+def test_acceptance_a11_exists_not_exists():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "A"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "B"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 2, "C"))
+    cur.execute("INSERT INTO orders (id, tenant_id, status) VALUES (%s, %s, %s)", (1, 1, "new"))
+
+    sql_exists = (
+        "SELECT u.id "
+        "FROM users u "
+        "WHERE u.tenant_id = %s AND EXISTS (SELECT id FROM orders o WHERE o.tenant_id = %s AND o.status = %s LIMIT 1) "
+        "ORDER BY u.id LIMIT %s"
+    )
+    cur.execute(sql_exists, (1, 1, "new", 10))
+    assert cur.fetchall() == [(1,), (2,)]
+
+    sql_not_exists = (
+        "SELECT u.id "
+        "FROM users u "
+        "WHERE u.tenant_id = %s AND NOT EXISTS (SELECT id FROM orders o WHERE o.tenant_id = %s AND o.status = %s LIMIT 1) "
+        "ORDER BY u.id LIMIT %s"
+    )
+    cur.execute(sql_not_exists, (1, 1, "new", 10))
+    assert cur.fetchall() == []
+    cur.execute(sql_not_exists, (1, 1, "missing", 10))
+    assert cur.fetchall() == [(1,), (2,)]
+    conn.close()
+
+
+def test_acceptance_a12_join_composite_on():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (10, 1, "Alice"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (10, 2, "OtherTenant"))
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, created_at) VALUES (%s, %s, %s, %s)",
+        (201, 10, 1, datetime.datetime(2024, 1, 2, 0, 0, 0)),
+    )
+    cur.execute(
+        "INSERT INTO orders (id, user_id, tenant_id, created_at) VALUES (%s, %s, %s, %s)",
+        (202, 10, 2, datetime.datetime(2024, 1, 3, 0, 0, 0)),
+    )
+    sql = (
+        "SELECT o.id, o.created_at, u.name "
+        "FROM orders o JOIN users u ON o.user_id = u.id AND o.tenant_id = u.tenant_id "
+        "WHERE o.tenant_id = %s "
+        "ORDER BY o.created_at DESC, o.id ASC LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 10, 0))
+    assert cur.fetchall() == [(201, datetime.datetime(2024, 1, 2, 0, 0, 0), "Alice")]
+    conn.close()
+
+
+def test_acceptance_a13_union_all_with_offset():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 1, "U3"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "A2"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (4, 1, "A4"))
+    sql = (
+        "SELECT id FROM users WHERE tenant_id = %s "
+        "UNION ALL SELECT id FROM archived_users WHERE tenant_id = %s "
+        "ORDER BY id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 1, 2, 1))
+    assert cur.fetchall() == [(2,), (3,)]
+    conn.close()
+
+
+def test_acceptance_a14_distinct_multi_columns():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO orders (id, tenant_id, status) VALUES (%s, %s, %s)", (1, 1, "new"))
+    cur.execute("INSERT INTO orders (id, tenant_id, status) VALUES (%s, %s, %s)", (2, 1, "new"))
+    cur.execute("INSERT INTO orders (id, tenant_id, status) VALUES (%s, %s, %s)", (3, 1, "done"))
+    cur.execute("INSERT INTO orders (id, tenant_id, status) VALUES (%s, %s, %s)", (4, 2, "new"))
+    sql = (
+        "SELECT DISTINCT tenant_id, status "
+        "FROM orders "
+        "WHERE tenant_id IN (%s, %s) "
+        "ORDER BY tenant_id, status LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 2, 10, 0))
+    assert cur.fetchall() == [(1, "done"), (1, "new"), (2, "new")]
+    conn.close()
+
+
+def test_acceptance_a15_count_distinct():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (1, 1, 10))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (2, 1, 10))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (3, 1, 11))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (4, 2, 20))
+    cur.execute("SELECT COUNT(DISTINCT user_id) AS uniq_users FROM orders WHERE tenant_id = %s", (1,))
+    assert cur.fetchall() == [(2,)]
+    cur.execute(
+        "SELECT tenant_id, COUNT(DISTINCT user_id) AS uniq_users FROM orders GROUP BY tenant_id ORDER BY tenant_id LIMIT %s",
+        (10,),
+    )
+    assert cur.fetchall() == [(1, 2), (2, 1)]
+    conn.close()
+
+
+def test_acceptance_a16_join_group_by():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 1, "U3"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 2, "U1-T2"))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (1, 1, 1))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (2, 1, 1))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (3, 1, 2))
+    cur.execute("INSERT INTO orders (id, tenant_id, user_id) VALUES (%s, %s, %s)", (4, 2, 1))
+    sql = (
+        "SELECT u.id, COUNT(o.id) AS order_cnt "
+        "FROM users u LEFT JOIN orders o ON u.id = o.user_id AND u.tenant_id = o.tenant_id "
+        "WHERE u.tenant_id = %s "
+        "GROUP BY u.id HAVING order_cnt >= %s ORDER BY order_cnt DESC, u.id ASC LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 1, 10, 0))
+    assert cur.fetchall() == [(1, 2), (2, 1)]
+    conn.close()
+
+
+def test_acceptance_a17_correlated_exists():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 2, "U3"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 3, 2))
+
+    sql_exists = (
+        "SELECT u.id "
+        "FROM users u "
+        "WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.tenant_id = u.tenant_id) "
+        "ORDER BY u.id LIMIT %s"
+    )
+    cur.execute(sql_exists, (20,))
+    assert cur.fetchall() == [(1,), (3,)]
+
+    sql_not_exists = (
+        "SELECT u.id "
+        "FROM users u "
+        "WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.tenant_id = u.tenant_id) "
+        "ORDER BY u.id LIMIT %s"
+    )
+    cur.execute(sql_not_exists, (20,))
+    assert cur.fetchall() == [(2,)]
+    conn.close()
+
+
+def test_acceptance_a18_union_distinct():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 2, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 1, "U3"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (10, 1, "A1"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (11, 2, "A2"))
+    sql = (
+        "SELECT tenant_id FROM users WHERE tenant_id IN (%s, %s) "
+        "UNION "
+        "SELECT tenant_id FROM archived_users WHERE tenant_id IN (%s, %s) "
+        "ORDER BY tenant_id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 2, 1, 2, 10, 0))
+    assert cur.fetchall() == [(1,), (2,)]
+    conn.close()
+
+
+def test_acceptance_a19_non_equi_join():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 2, "U3"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 2, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (12, 3, 2))
+    sql = (
+        "SELECT u.id, o.id "
+        "FROM users u JOIN orders o ON u.id >= o.user_id "
+        "WHERE u.tenant_id = %s "
+        "ORDER BY u.id, o.id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 20, 0))
+    assert cur.fetchall() == [(1, 10), (2, 10), (2, 11)]
+    conn.close()
+
+
+def test_acceptance_a20_with_cte():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 2, "U3"))
+    sql = (
+        "WITH active_users AS ("
+        "SELECT id, tenant_id FROM users WHERE tenant_id = %s"
+        ") "
+        "SELECT id FROM active_users WHERE id >= %s ORDER BY id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 2, 10, 0))
+    assert cur.fetchall() == [(2,)]
+    conn.close()
+
+
+def test_acceptance_a21_scalar_subquery():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, score, name) VALUES (%s, %s, %s, %s)", (1, 1, 10, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, score, name) VALUES (%s, %s, %s, %s)", (2, 1, 30, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, score, name) VALUES (%s, %s, %s, %s)", (3, 2, 20, "U3"))
+    sql = (
+        "SELECT id "
+        "FROM users "
+        "WHERE tenant_id = %s AND score >= (SELECT AVG(score) FROM users WHERE tenant_id = %s) "
+        "ORDER BY id LIMIT %s"
+    )
+    cur.execute(sql, (1, 1, 20))
+    assert cur.fetchall() == [(2,)]
+    conn.close()
+
+
+def test_acceptance_a22_union_all_three_way():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 2, "U2"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (10, 1, "A1"))
+    sql = (
+        "SELECT id FROM users WHERE tenant_id = %s "
+        "UNION ALL SELECT id FROM archived_users WHERE tenant_id = %s "
+        "UNION ALL SELECT id FROM users WHERE tenant_id = %s "
+        "ORDER BY id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 1, 2, 20, 0))
+    assert cur.fetchall() == [(1,), (2,), (10,)]
+    conn.close()
+
+
+def test_acceptance_a23_right_outer_join():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 99, 1))
+    sql = (
+        "SELECT u.id, o.id "
+        "FROM users u RIGHT OUTER JOIN orders o ON u.id = o.user_id "
+        "ORDER BY o.id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (20, 0))
+    assert cur.fetchall() == [(1, 10), (None, 11)]
+    conn.close()
+
+
+def test_acceptance_a24_right_outer_join_composite_on():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 1, 2))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (12, 99, 1))
+    sql = (
+        "SELECT u.id, o.id "
+        "FROM users u RIGHT OUTER JOIN orders o ON u.id = o.user_id AND u.tenant_id = o.tenant_id "
+        "WHERE o.tenant_id = %s "
+        "ORDER BY o.id LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (1, 20, 0))
+    assert cur.fetchall() == [(1, 10), (None, 12)]
+    conn.close()
+
+
+def test_acceptance_a25_full_outer_join():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 99, 1))
+    sql = (
+        "SELECT u.id AS uid, o.id AS oid "
+        "FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id "
+        "ORDER BY oid LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (20, 0))
+    assert cur.fetchall() == [(2, None), (1, 10), (None, 11)]
+    conn.close()
+
+
+def test_acceptance_a26_full_outer_join_composite_on():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 1, 2))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (12, 99, 1))
+    sql = (
+        "SELECT u.id AS uid, o.id AS oid "
+        "FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id AND u.tenant_id = o.tenant_id "
+        "ORDER BY uid, oid LIMIT %s OFFSET %s"
+    )
+    cur.execute(sql, (20, 0))
+    assert cur.fetchall() == [(None, 11), (None, 12), (1, 10), (2, None)]
+    conn.close()
+
+
+def test_acceptance_a27_full_outer_join_group_by():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 2, "U2"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (3, 3, "U3"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 99, 4))
+    sql = (
+        "SELECT COALESCE(u.tenant_id, o.tenant_id) AS tenant_id, COUNT(*) AS cnt "
+        "FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id "
+        "GROUP BY COALESCE(u.tenant_id, o.tenant_id) "
+        "ORDER BY tenant_id LIMIT %s"
+    )
+    cur.execute(sql, (20,))
+    assert cur.fetchall() == [(1, 1), (2, 1), (3, 1), (4, 1)]
+    conn.close()
+
+
+def test_acceptance_a27_full_outer_join_group_by_having():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 2, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 99, 4))
+    sql = (
+        "SELECT COALESCE(u.tenant_id, o.tenant_id) AS tenant_id, COUNT(*) AS cnt "
+        "FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id "
+        "GROUP BY COALESCE(u.tenant_id, o.tenant_id) "
+        "HAVING cnt >= %s "
+        "ORDER BY tenant_id LIMIT %s"
+    )
+    cur.execute(sql, (1, 20))
+    assert cur.fetchall() == [(1, 1), (2, 1), (4, 1)]
+    cur.execute(sql, (2, 20))
+    assert cur.fetchall() == []
     conn.close()
 
 
@@ -285,22 +782,32 @@ def test_missing_named_param_raises():
     conn.close()
 
 
-def test_union_without_all_is_rejected():
+def test_union_without_all_supported():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
-    cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (10, "X"))
-    with pytest.raises(MongoDbApiError) as exc:
-        cur.execute("SELECT id FROM users UNION SELECT id FROM users")
-    assert "[mdb][E2]" in str(exc.value)
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (10, 1, "X"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (11, 2, "Y"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (99, 1, "AX"))
+    cur.execute("INSERT INTO archived_users (id, tenant_id, name) VALUES (%s, %s, %s)", (100, 2, "AY"))
+    cur.execute(
+        "SELECT tenant_id FROM users WHERE tenant_id IN (%s, %s) "
+        "UNION SELECT tenant_id FROM archived_users WHERE tenant_id IN (%s, %s) "
+        "ORDER BY tenant_id",
+        (1, 2, 1, 2),
+    )
+    assert cur.fetchall() == [(1,), (2,)]
     conn.close()
 
 
-def test_non_equi_join_is_rejected():
+def test_non_equi_join_supported():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
-    with pytest.raises(MongoDbApiError) as exc:
-        cur.execute("SELECT * FROM users u JOIN orders o ON u.id > o.user_id")
-    assert "[mdb][E2]" in str(exc.value)
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (12, 2, 1))
+    cur.execute("SELECT u.id, o.id FROM users u JOIN orders o ON u.id >= o.user_id WHERE u.tenant_id = %s ORDER BY u.id, o.id", (1,))
+    assert cur.fetchall() == [(1, 11), (2, 11), (2, 12)]
     conn.close()
 
 
@@ -383,18 +890,18 @@ def test_sqlalchemy_core_join_and_union_all():
     metadata.drop_all(engine)
 
 
-def test_sqlalchemy_union_distinct_is_rejected():
+def test_sqlalchemy_union_distinct_supported():
     engine = create_engine(f"{DBAPI_URI}/{MONGODB_DB}")
     metadata = MetaData()
     users = Table("core_users5", metadata, Column("id", Integer, primary_key=True))
+    users_arch = Table("core_users5_arch", metadata, Column("id", Integer, primary_key=True))
     metadata.drop_all(engine)
     metadata.create_all(engine)
     with engine.begin() as conn:
         conn.execute(users.insert(), [{"id": 1}, {"id": 2}])
-        with pytest.raises(Exception) as exc:
-            stmt = select(users.c.id).where(users.c.id == 1).union(select(users.c.id).where(users.c.id == 2))
-            conn.execute(stmt).all()
-    assert "Unsupported SQL construct" in str(exc.value)
+        conn.execute(users_arch.insert(), [{"id": 2}, {"id": 3}])
+        stmt = select(users.c.id).union(select(users_arch.c.id)).order_by("id")
+        assert conn.execute(stmt).all() == [(1,), (2,), (3,)]
     metadata.drop_all(engine)
 
 
@@ -410,6 +917,18 @@ def test_union_all_with_order_limit():
     )
     rows = cur.fetchall()
     assert sorted(rows) == [(1,), (3,)]
+    conn.close()
+
+
+def test_union_mixed_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError):
+        cur.execute(
+            "SELECT id FROM users "
+            "UNION ALL SELECT id FROM archived_users "
+            "UNION SELECT id FROM users"
+        )
     conn.close()
 
 
@@ -468,11 +987,54 @@ def test_window_function_is_rejected():
     conn.close()
 
 
-def test_full_outer_join_is_rejected():
+def test_full_outer_join_composite_supported():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
-    with pytest.raises(MongoDbApiError):
-        cur.execute("SELECT * FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id")
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (11, 1, 2))
+    cur.execute(
+        "SELECT u.id AS uid, o.id AS oid "
+        "FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id AND u.tenant_id = o.tenant_id "
+        "ORDER BY uid, oid"
+    )
+    assert cur.fetchall() == [(None, 11), (1, 10), (2, None)]
+    conn.close()
+
+
+def test_right_outer_join_non_equi_on_rejected_explicit():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELECT u.id, o.id FROM users u RIGHT OUTER JOIN orders o ON u.id >= o.user_id")
+    assert "[mdb][E2]" in str(exc.value)
+    assert "RIGHT_JOIN_NON_EQ" in str(exc.value)
+    conn.close()
+
+
+def test_full_outer_join_non_equi_on_rejected_explicit():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute("SELECT u.id, o.id FROM users u FULL OUTER JOIN orders o ON u.id >= o.user_id")
+    assert "[mdb][E2]" in str(exc.value)
+    assert "FULL_JOIN_NON_EQ" in str(exc.value)
+    conn.close()
+
+
+def test_full_outer_join_chain_rejected_explicit():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError) as exc:
+        cur.execute(
+            "SELECT u.id, o.id, a.id "
+            "FROM users u "
+            "FULL OUTER JOIN orders o ON u.id = o.user_id "
+            "JOIN addresses a ON o.id = a.order_id"
+        )
+    assert "[mdb][E2]" in str(exc.value)
+    assert "FULL_JOIN_CHAIN" in str(exc.value)
     conn.close()
 
 
@@ -493,11 +1055,35 @@ def test_parse_error_returns_e5():
     conn.close()
 
 
-def test_correlated_subquery_is_rejected():
+def test_correlated_subquery_supported():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "A"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "B"))
+    cur.execute("INSERT INTO orders (id, user_id, tenant_id) VALUES (%s, %s, %s)", (10, 1, 1))
+    cur.execute(
+        "SELECT u.id FROM users u "
+        "WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.tenant_id = u.tenant_id) "
+        "ORDER BY u.id"
+    )
+    assert cur.fetchall() == [(1,)]
+    cur.execute(
+        "SELECT u.id FROM users u "
+        "WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.tenant_id = u.tenant_id) "
+        "ORDER BY u.id"
+    )
+    assert cur.fetchall() == [(2,)]
+    conn.close()
+
+
+def test_correlated_subquery_with_join_is_rejected():
     conn = connect(MONGODB_URI, MONGODB_DB)
     cur = conn.cursor()
     with pytest.raises(MongoDbApiError):
-        cur.execute("SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users x WHERE x.id = u.id)")
+        cur.execute(
+            "SELECT u.id FROM users u "
+            "WHERE EXISTS (SELECT o.id FROM orders o JOIN users x ON o.user_id = x.id WHERE o.user_id = u.id)"
+        )
     conn.close()
 
 
@@ -546,6 +1132,31 @@ def test_from_subquery_select():
     cur.execute("SELECT id, name FROM (SELECT id, name FROM users WHERE id >= %s) AS t WHERE id < %s ORDER BY id DESC", (2, 3))
     rows = cur.fetchall()
     assert rows == [(2, "B")]
+    conn.close()
+
+
+def test_with_recursive_is_rejected():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    with pytest.raises(MongoDbApiError):
+        cur.execute(
+            "WITH RECURSIVE t AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM t WHERE id < 3) "
+            "SELECT id FROM t"
+        )
+    conn.close()
+
+
+def test_with_cte_union_all_supported():
+    conn = connect(MONGODB_URI, MONGODB_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (1, 1, "U1"))
+    cur.execute("INSERT INTO users (id, tenant_id, name) VALUES (%s, %s, %s)", (2, 1, "U2"))
+    cur.execute(
+        "WITH tenant_users AS (SELECT id FROM users WHERE tenant_id = %s) "
+        "SELECT id FROM tenant_users UNION ALL SELECT id FROM tenant_users ORDER BY id",
+        (1,),
+    )
+    assert cur.fetchall() == [(1,), (1,), (2,), (2,)]
     conn.close()
 
 

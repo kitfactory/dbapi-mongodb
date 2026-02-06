@@ -1,12 +1,18 @@
 # dbapi-mongodb 仕様
 
-## 前提: サポートする SQL 構文（拡張後）
-- 対応: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`（コレクション作成/削除）、`CREATE/DROP INDEX`、`WHERE` の比較 (`=`/`<>`/`>`/`<`/`<=`/`>=`)、`AND`、`OR`、`IN`、`BETWEEN`、`LIKE`（`%`/`_` を `$regex` に変換）、`ILIKE`、正規表現リテラル、`ORDER BY`、`LIMIT`、`OFFSET`、INNER/LEFT JOIN の等価結合（複合キー、最大 3 段）、`GROUP BY` + 集約（COUNT/SUM/AVG/MIN/MAX）+ `HAVING`（集計 alias を解決）、`UNION ALL`、サブクエリ（`WHERE IN/EXISTS`、`FROM (SELECT ...)`）、`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`（MongoDB 5.x+）、簡易 CASE 集計（`SUM(CASE WHEN ... THEN ... ELSE ... END)` の単一 WHEN）
-- 強化予定（P5/P6）: JOIN 投影/alias 解決の強化、CASE を含む集計 (`SUM(CASE WHEN ... THEN ... ELSE ... END)`)、HAVING での集計 alias 解決、ROW_NUMBER 以外の基本ウィンドウ関数（MongoDB 5+ 前提）の検討。
-- 非対応: 非等価 JOIN、フル/右外部 JOIN、`ROW_NUMBER` 以外のウィンドウ関数、MongoDB 5 未満でのウィンドウ関数、`UNION`（重複除去）。
+## 前提: サポートする SQL 構文（MongoDB 4.4 ターゲット）
+- 目的: 生SQL互換を優先し、MongoDB 4.4 上で実運用できる範囲を先に固める。
+- 対応（4.4）: `SELECT/INSERT/UPDATE/DELETE`、`CREATE/DROP TABLE`（コレクション作成/削除）、`CREATE/DROP INDEX`、`WHERE` の比較 (`=`/`<>`/`>`/`<`/`<=`/`>=`)、`AND`、`OR`、`IN`、`IS NULL/IS NOT NULL`、`NOT`（限定: `NOT IN` / `NOT LIKE` / `NOT (a=b)` / `NOT (x IS NULL)` / `NOT EXISTS`）、`BETWEEN`、`LIKE`（`%`/`_` を `$regex` に変換）、`ILIKE`、正規表現リテラル、`SELECT DISTINCT`（複数列）、`ORDER BY`、`LIMIT`、`OFFSET`、INNER/LEFT JOIN（最大 3 段、`ON a=b AND c=d` の複合等価、`ON` の比較条件を含む）、RIGHT OUTER JOIN（単一 JOIN のみ）、FULL OUTER JOIN（単一 JOIN・等価 ON（単一/複合））、`GROUP BY` + 集約（COUNT/SUM/AVG/MIN/MAX/COUNT DISTINCT）+ `HAVING`（集計 alias を解決、JOIN を含む集計にも適用）、`UNION ALL` / `UNION`（3 項以上を含む多段連結、連結後 `ORDER BY/LIMIT/OFFSET`）、サブクエリ（`WHERE IN/EXISTS/NOT EXISTS`（相関 EXISTS/NOT EXISTS は単一サブクエリ・単一テーブルの相関条件を対応）、比較式でのスカラサブクエリ、`FROM (SELECT ...)`）、`WITH`（非再帰 CTE）、簡易 CASE 集計（`SUM(CASE WHEN ... THEN ... ELSE ... END)` の単一 WHEN）。FULL OUTER JOIN + `GROUP BY/HAVING` は `COALESCE(left_col, right_col)` と `COUNT(*)` のパターンをサポート。
+- 非対応（4.4）: ウィンドウ関数（MongoDB 5+ 専用）、非等価 ON を含む RIGHT/FULL OUTER JOIN、複数 JOIN を含む RIGHT/FULL JOIN 連鎖、FULL OUTER JOIN + 集計の複雑形（複数集計式・`COALESCE` 以外のグループキー等）、相関サブクエリのうち複雑形（複数テーブル/複数ネスト/SELECT 列での相関）、再帰 CTE（`WITH RECURSIVE`）、`UNION`/`UNION ALL` の混在連結など。
+- 参考（MongoDB 5+）: ウィンドウ関数（`ROW_NUMBER/RANK/DENSE_RANK`）は 5+ 専用拡張として付録に記載する。
 - プレースホルダー: `%s` と `%(name)s` の両方に対応（不足/余剰は `[mdb][E4]`）。
 - `SELECT *` 時のフィールド順: コレクションのフィールド名をアルファベット順で返す。明示列指定時は SQL 記述順で返す。JOIN 時の `SELECT *` は左テーブル→右テーブルの順でアルファベット順。
 - パーサー: SQLGlot を使用し、将来のサブクエリ対応を可能にする。
+
+## リリース方針（Join-first / 4.4）
+- 本リリースの正式保証は JOIN 系とする。対象は INNER/LEFT、複合 ON、非等価 ON、最大 3 段、JOIN 後の `ORDER BY/LIMIT/OFFSET`、JOIN + `GROUP BY/HAVING`。
+- JOIN 以外の拡張 SQL は利用可能なものを維持しつつ、改善優先度は future とする。
+- 対応外/制約外の構文は必ず `[mdb][E2] Unsupported SQL construct: <keyword>` で明示エラーにする。
 
 ## 1. 接続 (F1)
 ### 1.1. connect() に URI を渡した場合、MongoClient を初期化する (F1)
@@ -75,10 +81,80 @@
 - 条件: `cursor.execute(sql)`
 - 振る舞い: FROM 句のサブクエリを先行実行し、得られた行をインラインビューとして保持した上で、外側の WHERE/ORDER/LIMIT/投影を適用する（非相関サブクエリのみサポート）。
 
-### 2.10. ROW_NUMBER ウィンドウ関数をサポートする (F12)
-- 前提: `SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY created_at) AS rn FROM items`
+### 2.10. JOIN を含む SELECT で ORDER BY を指定した場合、テーブル修飾/alias を解決して並べ替える (F2, F8, F17)
+- 前提: `SELECT u.id, o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.total DESC`
 - 条件: `cursor.execute(sql)`
-- 振る舞い: MongoDB 5.x 以降では `$setWindowFields` を用いて ROW_NUMBER を計算する。PARTITION BY が省略された場合は全件を一括で計算する。MongoDB 5 未満では `[mdb][E2] Unsupported SQL construct: WINDOW_FUNCTION` を返す。
+- 振る舞い: `$lookup` の結果（右テーブル列）を含めた列解決を行い、JOIN 先列は `__joinN.<field>` を `$sort` 対象として扱う。
+
+### 2.11. JOIN を含む SELECT で LIMIT/OFFSET を指定した場合、OFFSET→LIMIT の順に適用する (F2, F8, F17)
+- 前提: `SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.id LIMIT 10 OFFSET 5`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: SQL セマンティクスに合わせ、`$sort` の後に `$skip`（OFFSET）→ `$limit`（LIMIT）の順で適用する。
+
+### 2.12. UNION ALL に ORDER BY/LIMIT/OFFSET を指定した場合、連結後の結果に適用する (F2, F17)
+- 前提: `SELECT id FROM users UNION ALL SELECT id FROM archived_users ORDER BY id LIMIT 10 OFFSET 0`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 2 つの SELECT 結果を連結した後の結果集合に対して `ORDER BY/LIMIT/OFFSET` を適用する（部分集合ごとの並べ替えではない）。
+
+### 2.13. SELECT DISTINCT を複数列で指定した場合、複合キーで重複排除する (F2, F17)
+- 前提: `SELECT DISTINCT tenant_id, status FROM orders ORDER BY tenant_id, status LIMIT 20 OFFSET 0`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 指定列の組み合わせをキーに重複排除し、`ORDER BY/LIMIT/OFFSET` を適用して返す。
+
+### 2.14. COUNT(DISTINCT <column>) を指定した場合、ユニーク件数を返す (F2, F8, F17)
+- 前提: `SELECT COUNT(DISTINCT user_id) FROM orders` または `SELECT tenant_id, COUNT(DISTINCT user_id) FROM orders GROUP BY tenant_id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 対象列のユニーク値数を返す。GROUP BY がある場合はグループ単位でユニーク件数を返す。
+
+### 2.15. JOIN を含む GROUP BY で集計した場合、JOIN 後の結果に対して集約/HAVING/並び替えを適用する (F2, F8, F17)
+- 前提: `SELECT u.id, COUNT(o.id) AS order_cnt FROM users u LEFT JOIN orders o ON u.id = o.user_id AND u.tenant_id = o.tenant_id WHERE u.tenant_id = 1 GROUP BY u.id HAVING order_cnt >= 1 ORDER BY order_cnt DESC, u.id ASC LIMIT 20 OFFSET 0`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: JOIN 後の行集合に対して `GROUP BY` 集約を実施し、`HAVING` で集計 alias を評価した上で `ORDER BY/LIMIT/OFFSET` を適用する。`COUNT(o.id)` は NULL を件数に含めない。
+
+### 2.16. 相関 EXISTS/NOT EXISTS を指定した場合、外側行に依存して真偽判定する (F2, F11, F17)
+- 前提: `SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.tenant_id = u.tenant_id) ORDER BY u.id LIMIT 20`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 外側行の列をサブクエリ評価に渡して `EXISTS/NOT EXISTS` を判定する。対象は単一サブクエリ・単一テーブルの相関条件に限定する。
+
+### 2.17. UNION（重複除去）に ORDER BY/LIMIT/OFFSET を指定した場合、重複除去後の結果に適用する (F2, F17)
+- 前提: `SELECT tenant_id FROM users UNION SELECT tenant_id FROM archived_users ORDER BY tenant_id LIMIT 20 OFFSET 0`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: UNION 結果で重複行を除去した後の結果集合に対して `ORDER BY/LIMIT/OFFSET` を適用する。
+
+### 2.18. JOIN の ON 句に比較条件を含む場合、$lookup pipeline で評価する (F2, F8, F17)
+- 前提: `SELECT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id AND o.total >= u.min_total WHERE u.tenant_id = 1`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `ON` 句の比較条件（`>=`, `<=`, `>`, `<`, `<>`）を `$expr` で評価する。結合段数は最大 3 段とする。
+
+### 2.19. WITH（非再帰 CTE）を指定した場合、CTE をサブクエリとしてインライン展開する (F2, F11, F17)
+- 前提: `WITH active_users AS (SELECT id, tenant_id FROM users WHERE tenant_id = 1) SELECT id FROM active_users WHERE id >= 10 ORDER BY id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: CTE 定義をインラインサブクエリとして展開し、外側 SELECT に対して `WHERE/ORDER BY/LIMIT/OFFSET` を適用する。`WITH RECURSIVE` は `[mdb][E2]` とする。
+
+### 2.20. 比較式に非相関スカラサブクエリを指定した場合、先頭行先頭列を単一値として比較する (F2, F11, F17)
+- 前提: `SELECT id FROM users WHERE score >= (SELECT AVG(score) FROM users WHERE tenant_id = 1) ORDER BY id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: サブクエリを先行実行し、先頭行先頭列を単一値として比較演算（`=`, `<>`, `>`, `>=`, `<`, `<=`）に適用する。結果 0 件時は `NULL` 相当として比較する。
+
+### 2.21. UNION/UNION ALL を 3 項以上で連結した場合、左から順に連結し末尾で ORDER/LIMIT/OFFSET を適用する (F2, F17)
+- 前提: `SELECT id FROM users UNION ALL SELECT id FROM archived_users UNION ALL SELECT id FROM users ORDER BY id LIMIT 20`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 3 項以上の UNION 連結を左結合でフラット化して実行し、最終結果に `ORDER BY/LIMIT/OFFSET` を適用する。`UNION` と `UNION ALL` の混在連結は `[mdb][E2]` とする。
+
+### 2.22. RIGHT OUTER JOIN（単一 JOIN）を指定した場合、LEFT JOIN に正規化して同等セマンティクスで実行する (F2, F8, F17)
+- 前提: `SELECT u.id, o.id FROM users u RIGHT OUTER JOIN orders o ON u.id = o.user_id` または `... ON u.id = o.user_id AND u.tenant_id = o.tenant_id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 単一の RIGHT JOIN は内部で LEFT JOIN へ正規化して実行し、右側欠損保持を含む結果を返す。ON は単一等価または複合等価（`AND`）を許可する。非等価 ON は `[mdb][E2] Unsupported SQL construct: RIGHT_JOIN_NON_EQ`、複数 JOIN を含む RIGHT JOIN は `[mdb][E2] Unsupported SQL construct: RIGHT_JOIN_CHAIN` とする。
+
+### 2.23. FULL OUTER JOIN（単一 JOIN・等価 ON（単一/複合））を指定した場合、LEFT JOIN と右片側差分を UNION ALL して実行する (F2, F8, F17)
+- 前提: `SELECT u.id AS uid, o.id AS oid FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id ORDER BY oid` または `... ON u.id = o.user_id AND u.tenant_id = o.tenant_id`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: 単一 JOIN の等価 ON（単一/複合）の FULL JOIN は `LEFT JOIN` 結果と、反対向き `LEFT JOIN` の「右片側差分（左キー群 IS NULL）」を `UNION ALL` して実行する。`ORDER BY/LIMIT/OFFSET` は統合後の全体結果に適用する。非等価 ON は `[mdb][E2] Unsupported SQL construct: FULL_JOIN_NON_EQ`、複数 JOIN を含む FULL JOIN は `[mdb][E2] Unsupported SQL construct: FULL_JOIN_CHAIN` とする。
+
+### 2.24. FULL OUTER JOIN 後に COALESCE キーで GROUP BY/HAVING を指定した場合、DB 側で UNION 統合後に集計する (F2, F8, F17)
+- 前提: `SELECT COALESCE(u.tenant_id, o.tenant_id) AS tenant_id, COUNT(*) AS cnt FROM users u FULL OUTER JOIN orders o ON u.id = o.user_id GROUP BY COALESCE(u.tenant_id, o.tenant_id) HAVING cnt >= 1 ORDER BY tenant_id LIMIT 20`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: `LEFT JOIN` と右片側差分を `$unionWith` で統合後、`$group` で `COALESCE` キーごとに `COUNT(*)` を集計し、`HAVING/ORDER BY/LIMIT/OFFSET` を適用する。対象は `COALESCE(left_col, right_col) + COUNT(*)` の単一グループキー・単一件数集計パターンに限定する。
 
 ## 3. DML 変換 (F3)
 ### 3.1. INSERT が insert_one に変換される (F3)
@@ -191,10 +267,11 @@
 
 ## 11. 拡張機能（F11/F12）
 - P1: SQLAlchemy Core 強化（Table/Column CRUD/DDL/Index を実通信で通す）  
-  - サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)` を先行実行し、結果リスト/存在可否で置換する（非相関のみ）。`FROM (SELECT ...) AS t` は拡張対象（スカラサブクエリは非対応）。  
-  - UNION/UNION ALL: `UNION ALL` のみサポート（重複除去は [mdb][E2]）。ORDER/LIMIT は全体にのみ適用。  
+  - サブクエリ: `WHERE IN (SELECT ...)`、`EXISTS (SELECT ...)`、比較式のスカラサブクエリを先行実行して置換する。相関は `EXISTS/NOT EXISTS` の単一サブクエリ・単一テーブルに限定して対応し、複雑相関は [mdb][E2]。`FROM (SELECT ...) AS t` は拡張対象。  
+  - CTE: 非再帰 CTE（`WITH`）をサブクエリとしてインライン展開して処理する。`WITH RECURSIVE` は [mdb][E2]。  
+  - UNION/UNION ALL: `UNION ALL` と `UNION`（重複除去）をサポートし、3 項以上の多段連結も扱う。`ORDER BY/LIMIT/OFFSET` は連結/重複除去後の全体結果に適用。  
   - HAVING: GROUP BY 後の比較/AND/OR/IN/BETWEEN/LIKE を `$match` として適用（非集計列を含む HAVING は [mdb][E2]）。  
-  - JOIN 拡張: 等価 JOIN の多段（最大 3 段）。非等価 JOIN、RIGHT/FULL OUTER は当面 [mdb][E2]。  
+  - JOIN 拡張: 等価 JOIN と `ON` 比較条件（`>=`, `<=`, `>`, `<`, `<>`）を含む JOIN を最大 3 段まで対応。RIGHT OUTER は単一 JOIN、FULL OUTER は単一 JOIN かつ等価 ON（単一/複合）を対応し、それ以外は [mdb][E2]。  
   - 文字列マッチ拡張: `ILIKE` を大小区別なし `$regex`、`/pattern/` の正規表現リテラルも `$regex` で対応。  
   - 名前付きパラメータ: `%(name)s` を dict で受け、不足/余剰は [mdb][E4]。  
   - 型拡張: Decimal/UUID は文字列化、tz 付き datetime はそのまま返却、Binary は base64 文字列化。未対応型は文字列化。  
@@ -203,3 +280,9 @@
 - P4: Mongo 5+ 拡張（低優先度。`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` を `$setWindowFields` で対応。Mongo 5.0 未満は [mdb][E2]。その他のウィンドウ関数は非対応。7.x で動作確認済み）
 - P5: JOIN 投影/alias 強化、CASE 集計（`SUM(CASE WHEN ... THEN ... END)`）、HAVING で集計 alias を解決。JOIN + WHERE/HAVING の alias 解決を強化する。
 - P6: ウィンドウ関数拡張（ROW_NUMBER 以外の基本ウィンドウ関数を検討。MongoDB 5+ 前提）
+
+## 付録A: MongoDB 5+ のみの拡張（参考）
+### A.1. ROW_NUMBER/RANK/DENSE_RANK ウィンドウ関数をサポートする (F16)
+- 前提: `SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY created_at) AS rn FROM items`
+- 条件: `cursor.execute(sql)`
+- 振る舞い: MongoDB 5.x 以降では `$setWindowFields` を用いてウィンドウ関数を計算する。MongoDB 5 未満では `[mdb][E2] Unsupported SQL construct: WINDOW_FUNCTION` を返す。
